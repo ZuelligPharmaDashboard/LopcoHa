@@ -7,6 +7,32 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   import.meta.url
 ).toString();
 
+function decodeHtmlEntities(str) {
+  if (!str) return '';
+  return str
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(Number(dec)));
+}
+
+function htmlToCleanLinesText(html) {
+  if (!html) return '';
+  const withNewlines = html
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(?:p|div|tr|li|h[1-6])>/gi, '\n')
+    .replace(/<\/(?:td|th)>/gi, '   ');
+  const stripped = withNewlines.replace(/<[^>]+>/g, '');
+  return decodeHtmlEntities(stripped)
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n');
+}
+
 /**
  * Đọc nội dung văn bản từ file Word (.docx), PDF (.pdf) hoặc Text (.txt)
  * Trả về { plainText, htmlText, pageCount }
@@ -20,8 +46,9 @@ export async function extractRawContentFromFile(file) {
       mammoth.extractRawText({ arrayBuffer }),
       mammoth.convertToHtml({ arrayBuffer })
     ]);
+    const cleanFromHtml = htmlToCleanLinesText(htmlRes.value || '');
     return {
-      plainText: rawRes.value || '',
+      plainText: cleanFromHtml || rawRes.value || '',
       htmlText: htmlRes.value || '',
       pageCount: 1
     };
@@ -82,9 +109,13 @@ function extractBoldAnswersFromHtml(htmlText) {
   const boldMap = {};
   if (!htmlText) return boldMap;
 
-  const qChunks = htmlText.split(/(?=(?:<p[^>]*>\s*(?:<strong>)?\s*(?:Câu|Bài|Question)\s*\d+))/i);
+  const qChunks = htmlText.split(
+    /(?=(?:<p[^>]*>\s*(?:<strong>)?\s*(?:Câu|Bài|Question|\d+\s*[.)])\s*))/i
+  );
   qChunks.forEach((chunk) => {
-    const qMatch = chunk.match(/(?:Câu|Bài|Question)\s*(\d+)/i);
+    const qMatch =
+      chunk.match(/(?:Câu|Bài|Question)\s*(\d+)/i) ||
+      chunk.match(/<p[^>]*>\s*(?:<strong>)?\s*(\d+)\s*[.)]/i);
     if (!qMatch) return;
     const qNum = qMatch[1];
 
@@ -133,7 +164,8 @@ function extractAnswerKeySection(fullText) {
     const keyBlob = keyLines.join('\n');
 
     // Dạng 1: 1.A | 1: A | 1-A | 1) A | Câu 1: A | Câu 1: 12.5
-    const pairRegex = /(?:Câu\s*)?(\d+)\s*[:.\-)]\s*([^\s,;\|\t]+(?:\s+[^\s,;\|\t]+)?)/gi;
+    const pairRegex =
+      /(?:Câu\s*)?(\d+)\s*[:.\-)]\s*([^\s,;\|\t]+(?:\s+[^\s,;\|\t]+)?)/gi;
     let m;
     while ((m = pairRegex.exec(keyBlob)) !== null) {
       const qNum = m[1];
@@ -165,20 +197,36 @@ function extractAnswerKeySection(fullText) {
 
 /**
  * Bộ phân tích Rule-Based 100% nguyên văn từ nội dung trích xuất (Không cần AI)
+ * Xử lý chuẩn cả trường hợp Word/PDF bị dính liền chữ như "money.A. so" hoặc "sentence?A. Because"
  */
 export function parseQuestionsFromExtractedContent({ plainText, htmlText = '' }) {
   const boldMap = extractBoldAnswersFromHtml(htmlText);
   const { bodyText, keyMap } = extractAnswerKeySection(plainText);
   const combinedKeyMap = { ...boldMap, ...keyMap };
 
-  const lines = bodyText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const lines = bodyText
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
   const blocks = [];
   let currentBlock = null;
 
   const qStartRegex = /^(?:Câu|Bài|Question)\s*(\d+)\s*[:.\-)]\s*(.*)$/i;
   const numStartRegex = /^(\d+)\s*[.)]\s+(.*)$/;
+  const sectionHeaderRegex =
+    /^(?:Part|Phần|Section|PHẦN|CHUYÊN\s*ĐỀ)\s+[A-Z0-9IVX]+\b/i;
 
   lines.forEach((line) => {
+    // Ngắt block khi gặp tiêu đề phần mới (VD: "Part B. Phrasal verbs (câu 7–13)") để không dính vào đáp án D câu trước
+    if (sectionHeaderRegex.test(line)) {
+      if (currentBlock) {
+        blocks.push(currentBlock);
+        currentBlock = null;
+      }
+      return;
+    }
+
     const m1 = line.match(qStartRegex);
     const m2 = !m1 ? line.match(numStartRegex) : null;
 
@@ -210,42 +258,44 @@ export function parseQuestionsFromExtractedContent({ plainText, htmlText = '' })
     ];
   }
 
+  // Khớp mốc A. / B. / C. / D. đứng đầu dòng, sau khoảng trắng, hoặc dính ngay sau dấu câu (. ? ! ” " ) … : ;)
+  const optMarkerRegex = /(?:^|[\s.?!…”"')…:;])([A-D])\s*[.)]\s*/g;
+  const expectedOrder = ['A', 'B', 'C', 'D'];
+
   const parsedQuestions = blocks.map((blk, idx) => {
     const qNum = blk.number || String(idx + 1);
-    const questionStem = [];
+    const fullBlock = blk.rawLines.join('\n').trim();
+
+    const allMatches = [...fullBlock.matchAll(optMarkerRegex)];
+    const seqMatches = [];
+    let expIdx = 0;
+
+    for (const m of allMatches) {
+      const letter = m[1].toUpperCase();
+      if (expIdx < 4 && letter === expectedOrder[expIdx]) {
+        const letterRelIdx = m[0].search(/[A-D]/i);
+        const markerStart = m.index + (letterRelIdx >= 0 ? letterRelIdx : 0);
+        const contentStart = m.index + m[0].length;
+        seqMatches.push({ letter, markerStart, contentStart });
+        expIdx += 1;
+      }
+    }
+
     const options = { A: '', B: '', C: '', D: '' };
-    let activeOpt = null;
+    let stemText = fullBlock;
 
-    blk.rawLines.forEach((line) => {
-      // Kiểm tra nhiều đáp án nằm cùng 1 hàng: "A. 10   B. 20   C. 30   D. 40"
-      const inlineMatches = [
-        ...line.matchAll(/(?:^|\s+)([A-D])\s*[.):]\s*(.*?)(?=(?:\s+[A-D]\s*[.):])|$)/g)
-      ];
-
-      if (inlineMatches.length >= 2) {
-        inlineMatches.forEach((im) => {
-          const letter = im[1].toUpperCase();
-          options[letter] = im[2].trim();
-          activeOpt = letter;
-        });
-        return;
+    if (seqMatches.length >= 2) {
+      stemText = fullBlock.slice(0, seqMatches[0].markerStart).trim();
+      for (let i = 0; i < seqMatches.length; i++) {
+        const cur = seqMatches[i];
+        const nextStart =
+          i + 1 < seqMatches.length ? seqMatches[i + 1].markerStart : fullBlock.length;
+        options[cur.letter] = fullBlock
+          .slice(cur.contentStart, nextStart)
+          .replace(/\s+/g, ' ')
+          .trim();
       }
-
-      // Kiểm tra đáp án bắt đầu đầu dòng: "A. Nội dung..."
-      const singleOptMatch = line.match(/^([A-D])\s*[.):]\s*(.*)$/);
-      if (singleOptMatch) {
-        const letter = singleOptMatch[1].toUpperCase();
-        options[letter] = singleOptMatch[2].trim();
-        activeOpt = letter;
-        return;
-      }
-
-      if (activeOpt) {
-        options[activeOpt] = `${options[activeOpt]} ${line}`.trim();
-      } else {
-        questionStem.push(line);
-      }
-    });
+    }
 
     const hasOptions = Boolean(options.A || options.B || options.C || options.D);
     const detectedAnswer = combinedKeyMap[qNum] || '';
@@ -261,7 +311,7 @@ export function parseQuestionsFromExtractedContent({ plainText, htmlText = '' })
       id: `q-${qNum}-${idx}`,
       number: Number(qNum) || idx + 1,
       type: qType,
-      text: questionStem.join('\n').trim() || `Câu hỏi số ${qNum}`,
+      text: stemText || `Câu hỏi số ${qNum}`,
       options,
       correctAnswer: detectedAnswer
     };
