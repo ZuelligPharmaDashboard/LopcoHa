@@ -23,7 +23,13 @@ import {
   Trash2,
   Sparkles,
   BookOpen,
-  ExternalLink
+  ExternalLink,
+  BarChart3,
+  Edit3,
+  Timer,
+  UserCheck,
+  UserX,
+  Award
 } from 'lucide-react';
 import {
   getSupabaseClient,
@@ -34,7 +40,8 @@ import {
 import {
   extractRawContentFromFile,
   parseQuestionsFromExtractedContent,
-  parseQuestionsWithGeminiAI
+  parseQuestionsWithGeminiAI,
+  generateExplanationsWithGeminiAI
 } from './fileQuestionParser';
 
 const TEACHER_PASSCODE = import.meta.env.VITE_TEACHER_PASSCODE || '2026';
@@ -75,36 +82,120 @@ function generateRandomPin() {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
 
-// Trích xuất danh sách câu hỏi dù lưu ở cột questions_json hay nhúng dự phòng trong rubric
+// Trích xuất danh sách câu hỏi từ cột questions_json hoặc chuỗi nhúng trong rubric
 function getAssignmentQuestions(asg) {
   if (!asg) return [];
+  let rawList = [];
   if (Array.isArray(asg.questions_json) && asg.questions_json.length > 0) {
-    return asg.questions_json;
-  }
-  if (typeof asg.rubric === 'string' && asg.rubric.includes('__SC_QUESTIONS__:')) {
+    rawList = asg.questions_json;
+  } else if (typeof asg.rubric === 'string' && asg.rubric.includes('__SC_QUESTIONS__:')) {
     try {
       const jsonPart = asg.rubric.split('__SC_QUESTIONS__:')[1];
       const parsed = JSON.parse(jsonPart);
-      if (Array.isArray(parsed)) return parsed;
+      if (Array.isArray(parsed)) rawList = parsed;
     } catch {
-      return [];
+      rawList = [];
     }
   }
-  return [];
+  // Chuẩn hóa loại câu hỏi về 2 nhóm duy nhất: 'mcq' và 'open'
+  return rawList.map((q, idx) => ({
+    ...q,
+    number: Number(q.number) || idx + 1,
+    type: q.type === 'mcq' ? 'mcq' : 'open',
+    passage: q.passage || '',
+    explanation: q.explanation || ''
+  }));
+}
+
+// Trích xuất cấu hình bổ sung của đề (thời gian làm bài...) từ rubric
+function getAssignmentMeta(asg) {
+  if (!asg || typeof asg.rubric !== 'string') {
+    return { timeLimitMinutes: 0 };
+  }
+  const match = asg.rubric.match(/__SC_META__:(\{.*?\})(?:\n|$)/);
+  if (match) {
+    try {
+      const parsed = JSON.parse(match[1]);
+      return {
+        timeLimitMinutes: Number(parsed.timeLimitMinutes) || 0
+      };
+    } catch {
+      return { timeLimitMinutes: 0 };
+    }
+  }
+  return { timeLimitMinutes: 0 };
 }
 
 function getCleanRubricText(asg) {
   if (!asg?.rubric) return '';
-  return asg.rubric.split('__SC_QUESTIONS__:')[0].trim();
+  return asg.rubric
+    .split('__SC_QUESTIONS__:')[0]
+    .replace(/__SC_META__:\{.*?\}(\n|$)/g, '')
+    .trim();
 }
 
-// Chấm điểm tự động 100% không cần AI dựa trên bộ câu hỏi tương tác
+// Tính cảnh báo hạn nộp còn mấy ngày
+function getDeadlineBadgeInfo(dueDateStr) {
+  if (!dueDateStr) return null;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const due = new Date(dueDateStr + 'T00:00:00');
+  if (Number.isNaN(due.getTime())) return null;
+
+  const diffDays = Math.round((due.getTime() - today.getTime()) / 86400000);
+  if (diffDays < 0) {
+    return {
+      diffDays,
+      urgent: true,
+      label: `Quá hạn ${Math.abs(diffDays)} ngày`,
+      badgeClass: 'bg-rose-50 text-rose-700 border-rose-200'
+    };
+  }
+  if (diffDays === 0) {
+    return {
+      diffDays: 0,
+      urgent: true,
+      label: 'Hết hạn HÔM NAY',
+      badgeClass: 'bg-rose-600 text-white border-rose-600 animate-pulse'
+    };
+  }
+  if (diffDays === 1) {
+    return {
+      diffDays: 1,
+      urgent: true,
+      label: 'Còn 1 ngày (Hạn ngày mai)',
+      badgeClass: 'bg-amber-50 text-amber-800 border-amber-300'
+    };
+  }
+  if (diffDays <= 3) {
+    return {
+      diffDays,
+      urgent: true,
+      label: `Còn ${diffDays} ngày nữa hết hạn`,
+      badgeClass: 'bg-amber-50 text-amber-700 border-amber-200'
+    };
+  }
+  return {
+    diffDays,
+    urgent: false,
+    label: `Còn ${diffDays} ngày (${due.toLocaleDateString('vi-VN')})`,
+    badgeClass: 'bg-slate-100 text-slate-600 border-slate-200'
+  };
+}
+
+function formatSecondsMMSS(totalSec) {
+  const s = Math.max(0, Math.floor(totalSec));
+  const mins = Math.floor(s / 60);
+  const secs = s % 60;
+  return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+}
+
+// Chấm điểm tự động 100% + tạo nhận xét chi tiết từng câu sai & giải thích
 function gradeInteractiveQuestions(questions, studentAnswersMap, topic) {
   const gradableQuestions = questions.filter(
     (q) => q.correctAnswer && String(q.correctAnswer).trim() !== ''
   );
 
-  // Nếu bộ đề KHÔNG có đáp án sẵn (hoặc toàn câu tự luận) -> chuyển sang giáo viên chấm
   if (gradableQuestions.length === 0) {
     return null;
   }
@@ -112,6 +203,7 @@ function gradeInteractiveQuestions(questions, studentAnswersMap, topic) {
   let correctCount = 0;
   const wrongDetails = [];
   const breakdown = [];
+  const wrongNumbers = [];
 
   gradableQuestions.forEach((q) => {
     const key = String(q.number);
@@ -122,49 +214,69 @@ function gradeInteractiveQuestions(questions, studentAnswersMap, topic) {
     const normActual = actual.toLowerCase().replace(/\s+/g, '');
     const isRight = normActual !== '' && normActual === normExpected;
 
+    const expText =
+      q.type === 'mcq' && q.options?.[expected.toUpperCase()]
+        ? `${expected.toUpperCase()}. ${q.options[expected.toUpperCase()]}`
+        : expected;
+    const actText =
+      actual === ''
+        ? 'Bỏ trống'
+        : q.type === 'mcq' && q.options?.[actual.toUpperCase()]
+        ? `${actual.toUpperCase()}. ${q.options[actual.toUpperCase()]}`
+        : actual;
+
     if (isRight) {
       correctCount += 1;
       breakdown.push({
         question: key,
         status: 'correct',
         expected,
-        actual: actual || '(Bỏ trống)'
+        actual: actual || '(Bỏ trống)',
+        explanation: q.explanation || ''
       });
     } else {
-      wrongDetails.push(
-        `Câu ${key}: Em trả lời "${actual || 'Bỏ trống'}" — Đáp án đúng là "${expected}"`
-      );
+      wrongNumbers.push(`Câu ${key}`);
+      const line = q.explanation
+        ? `Câu ${key}: Em chọn "${actText}" — Đáp án đúng: "${expText}". 💡 Giải thích: ${q.explanation}`
+        : `Câu ${key}: Em chọn "${actText}" — Đáp án đúng: "${expText}"`;
+      wrongDetails.push(line);
       breakdown.push({
         question: key,
         status: 'wrong',
         expected,
-        actual: actual || '(Bỏ trống)'
+        actual: actual || '(Bỏ trống)',
+        explanation: q.explanation || ''
       });
     }
   });
 
-  // Nếu có xen kẽ câu tự luận chưa có đáp án thì đánh dấu chờ giáo viên duyệt thêm
-  const hasUngradedEssay = questions.some(
+  const hasUngradedOpen = questions.some(
     (q) => !q.correctAnswer || String(q.correctAnswer).trim() === ''
   );
 
   const score = Number(((correctCount / gradableQuestions.length) * 10).toFixed(2));
   const weakTopics = score < 8 && topic ? [topic] : [];
 
+  const autoComment = hasUngradedOpen
+    ? `Phần tự động chấm đúng ${correctCount}/${gradableQuestions.length} câu (${score}/10). Các câu tự luận chưa có đáp án mẫu đang chờ giáo viên chấm bổ sung.`
+    : wrongNumbers.length === 0
+    ? `Xuất sắc! Em làm đúng trọn vẹn ${correctCount}/${gradableQuestions.length} câu, nắm rất chắc kiến thức chuyên đề ${topic || 'bài học'}.`
+    : score >= 8
+    ? `Làm bài tốt (${correctCount}/${gradableQuestions.length} câu đúng). Em chỉ cần rà soát lại ${wrongNumbers.join(', ')} bên dưới để đạt điểm tối đa.`
+    : score >= 6.5
+    ? `Mức khá (${correctCount}/${gradableQuestions.length} câu đúng). Em còn nhầm ở ${wrongNumbers.slice(0, 8).join(', ')}${wrongNumbers.length > 8 ? '...' : ''} — xem kỹ đáp án đúng và giải thích bên dưới để củng cố phần ${topic || 'trọng tâm'}.`
+    : `Cần ôn tập thêm (${correctCount}/${gradableQuestions.length} câu đúng). Em mất điểm nhiều ở ${wrongNumbers.slice(0, 8).join(', ')}${wrongNumbers.length > 8 ? '...' : ''}. Hãy xem lại từng câu sai và làm bài ôn bổ trợ nhé!`;
+
   return {
     score,
-    hasUngradedEssay,
+    hasUngradedOpen,
     weakTopics,
     feedbackJson: {
       correctCount,
       totalCount: gradableQuestions.length,
       wrongDetails,
       breakdown,
-      summary: hasUngradedEssay
-        ? `Phần tự động chấm đúng ${correctCount}/${gradableQuestions.length} câu (${score}/10). Các câu tự luận đang chờ giáo viên chấm bổ sung.`
-        : score >= 8
-        ? `Rất tốt! Em làm đúng ${correctCount}/${gradableQuestions.length} câu, nắm vững chuyên đề ${topic || 'bài học'}.`
-        : `Em đúng ${correctCount}/${gradableQuestions.length} câu. Xem chi tiết câu sai bên dưới để ôn lại phần ${topic || 'trọng tâm'}.`
+      summary: autoComment
     }
   };
 }
@@ -201,10 +313,10 @@ function autoGradeLegacyTextAnswers(answerKeyRaw, studentAnswerRaw, topic) {
     const actual = stuMap[k] || '(Bỏ trống)';
     if (actual.replace(/\s+/g, '') === expected.replace(/\s+/g, '')) {
       correct += 1;
-      breakdown.push({ question: k.toUpperCase(), status: 'correct', expected, actual });
+      breakdown.push({ question: k.toUpperCase(), status: 'correct', expected, actual, explanation: '' });
     } else {
       wrongDetails.push(`Câu ${k.toUpperCase()}: Em chọn "${actual}" — Đáp án đúng là "${expected}"`);
-      breakdown.push({ question: k.toUpperCase(), status: 'wrong', expected, actual });
+      breakdown.push({ question: k.toUpperCase(), status: 'wrong', expected, actual, explanation: '' });
     }
   });
 
@@ -343,6 +455,8 @@ export default function App() {
 
   const [classes, setClasses] = useState([]);
   const [students, setStudents] = useState([]);
+  const [studentMetaMap, setStudentMetaMap] = useState({});
+  const [studentMetaAnnId, setStudentMetaAnnId] = useState(null);
   const [assignments, setAssignments] = useState([]);
   const [submissions, setSubmissions] = useState([]);
   const [announcements, setAnnouncements] = useState([]);
@@ -350,12 +464,23 @@ export default function App() {
   const [realtimeStatus, setRealtimeStatus] = useState('connecting');
   const [toast, setToast] = useState(null);
 
+  // Hộp thoại xác nhận xóa an toàn
+  const [confirmDialog, setConfirmDialog] = useState(null);
+
+  // Bộ lọc & Báo cáo giáo viên
   const [teacherTab, setTeacherTab] = useState('overview');
   const [selectedClassId, setSelectedClassId] = useState('all');
+  const [includeInactiveInStats, setIncludeInactiveInStats] = useState(false);
+  const [reportScope, setReportScope] = useState('week'); // 'week' | 'all'
+  const [customTeacherOverviewNote, setCustomTeacherOverviewNote] = useState('');
   const [chartTimeMode, setChartTimeMode] = useState('week');
   const [chartStudentFilter, setChartStudentFilter] = useState('all');
   const [deepDiveStudent, setDeepDiveStudent] = useState(null);
+  const [editingStudentStatus, setEditingStudentStatus] = useState(null);
+  const [stuStatusDraft, setStuStatusDraft] = useState('active');
+  const [stuNoteDraft, setStuNoteDraft] = useState('');
   const [reviewingSubmission, setReviewingSubmission] = useState(null);
+  const [analyticsAssignment, setAnalyticsAssignment] = useState(null);
 
   // Modal Generate nhanh ID & PIN
   const [showQuickGenModal, setShowQuickGenModal] = useState(false);
@@ -373,12 +498,15 @@ export default function App() {
   const [asgWeek, setAsgWeek] = useState(1);
   const [asgDueDate, setAsgDueDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [asgTopic, setAsgTopic] = useState('');
+  const [asgTimePreset, setAsgTimePreset] = useState('0'); // '0' | '15' | '30' | '45' | '60' | 'custom'
+  const [asgCustomMinutes, setAsgCustomMinutes] = useState('25');
   const [asgAnswerKey, setAsgAnswerKey] = useState('');
   const [asgRubric, setAsgRubric] = useState('');
   const [sourceFile, setSourceFile] = useState(null);
   const [rawExtractedText, setRawExtractedText] = useState('');
   const [parsedQuestions, setParsedQuestions] = useState([]);
   const [isParsingFile, setIsParsingFile] = useState(false);
+  const [isExplainingAi, setIsExplainingAi] = useState(false);
   const [isPublishingAsg, setIsPublishingAsg] = useState(false);
   const [geminiApiKey, setGeminiApiKey] = useState(() => localStorage.getItem('sc_gemini_key') || '');
   const [showAiKeyInput, setShowAiKeyInput] = useState(false);
@@ -389,20 +517,29 @@ export default function App() {
   const [remAnswerKey, setRemAnswerKey] = useState('');
   const [remNote, setRemNote] = useState('');
 
-  // Chấm bài thủ công kèm tick Đúng/Sai từng câu
+  // Chấm bài thủ công & sửa điểm
   const [gradeScore, setGradeScore] = useState('8.5');
   const [gradeWeakTopic, setGradeWeakTopic] = useState('');
   const [gradeComment, setGradeComment] = useState('');
   const [gradeQuestionMarks, setGradeQuestionMarks] = useState({});
   const [gradeQuestionNotes, setGradeQuestionNotes] = useState({});
 
-  // Cổng học sinh làm bài trực tiếp
+  // Cổng học sinh làm bài trực tiếp + Auto-save + Timer
   const [studentTab, setStudentTab] = useState('tasks');
   const [submittingAsg, setSubmittingAsg] = useState(null);
   const [stuInteractiveAnswers, setStuInteractiveAnswers] = useState({});
   const [stuAnswerInput, setStuAnswerInput] = useState('');
   const [stuPdfFile, setStuPdfFile] = useState(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [draftRestoredBanner, setDraftRestoredBanner] = useState(false);
+  const [remainingSeconds, setRemainingSeconds] = useState(null);
+  const [dismissedAnnIds, setDismissedAnnIds] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem('sc_dismissed_anns') || '[]');
+    } catch {
+      return [];
+    }
+  });
 
   const notify = useCallback((msg, type = 'success') => {
     setToast({ msg, type });
@@ -436,7 +573,26 @@ export default function App() {
       }
       if (asgRes.data) setAssignments(asgRes.data);
       if (subRes.data) setSubmissions(subRes.data);
-      if (annRes.data) setAnnouncements(annRes.data);
+      if (annRes.data) {
+        const metaRow = annRes.data.find((a) =>
+          String(a.message || '').startsWith('__SC_STUDENT_META__:')
+        );
+        if (metaRow) {
+          setStudentMetaAnnId(metaRow.id);
+          try {
+            const parsed = JSON.parse(metaRow.message.replace('__SC_STUDENT_META__:', ''));
+            setStudentMetaMap(parsed || {});
+          } catch {
+            setStudentMetaMap({});
+          }
+        } else {
+          setStudentMetaAnnId(null);
+          setStudentMetaMap({});
+        }
+        setAnnouncements(
+          annRes.data.filter((a) => !String(a.message || '').startsWith('__SC_'))
+        );
+      }
     } catch (err) {
       console.error('Lỗi tải dữ liệu Supabase:', err);
     } finally {
@@ -465,6 +621,112 @@ export default function App() {
     };
   }, [supabase, fetchAllData]);
 
+  // Lưu trạng thái Đang học / Nghỉ học + ghi chú của học sinh
+  const handleSaveStudentStatus = async (e) => {
+    e.preventDefault();
+    if (!editingStudentStatus || !supabase) return;
+    const nextMap = {
+      ...studentMetaMap,
+      [editingStudentStatus.id]: {
+        status: stuStatusDraft,
+        note: stuNoteDraft.trim()
+      }
+    };
+    const payloadMsg = `__SC_STUDENT_META__:${JSON.stringify(nextMap)}`;
+
+    try {
+      if (studentMetaAnnId) {
+        const { error } = await supabase
+          .from('announcements')
+          .update({ message: payloadMsg })
+          .eq('id', studentMetaAnnId);
+        if (error) throw error;
+      } else {
+        const { error } = await supabase
+          .from('announcements')
+          .insert([{ target_student_id: null, message: payloadMsg }]);
+        if (error) throw error;
+      }
+      setStudentMetaMap(nextMap);
+      setEditingStudentStatus(null);
+      notify(`Đã cập nhật trạng thái của ${editingStudentStatus.full_name}!`);
+      fetchAllData();
+    } catch (err) {
+      notify('Lỗi lưu trạng thái: ' + err.message, 'error');
+    }
+  };
+
+  // Các hàm Xóa có hộp thoại xác nhận an toàn
+  const requestDeleteAssignment = (asg) => {
+    setConfirmDialog({
+      title: 'Xác nhận xóa bài tập',
+      message: `Anh có chắc chắn muốn xóa bài "${asg.title}" và toàn bộ lượt nộp liên quan không? Thao tác này không thể hoàn tác.`,
+      confirmText: 'Xóa bài tập',
+      onConfirm: async () => {
+        await supabase.from('submissions').delete().eq('assignment_id', asg.id);
+        const { error } = await supabase.from('assignments').delete().eq('id', asg.id);
+        if (error) notify(error.message, 'error');
+        else {
+          notify(`Đã xóa bài tập "${asg.title}"!`);
+          fetchAllData();
+        }
+      }
+    });
+  };
+
+  const requestDeleteSubmission = (sub, studentName = '') => {
+    setConfirmDialog({
+      title: 'Xóa lượt nộp bài này?',
+      message: `Xóa lượt nộp của ${studentName || sub.student_code}? Sau khi xóa, dữ liệu test sẽ sạch và học sinh này có thể làm lại bài từ đầu.`,
+      confirmText: 'Xóa lượt nộp',
+      onConfirm: async () => {
+        const { error } = await supabase.from('submissions').delete().eq('id', sub.id);
+        if (error) notify(error.message, 'error');
+        else {
+          setReviewingSubmission(null);
+          notify('Đã xóa lượt nộp bài!');
+          fetchAllData();
+        }
+      }
+    });
+  };
+
+  const requestDeleteStudent = (stu) => {
+    setConfirmDialog({
+      title: 'Xóa tài khoản học sinh test?',
+      message: `Xóa vĩnh viễn "${stu.full_name}" (${stu.student_code}) khỏi hệ thống? (Lưu ý: Nếu là học sinh thật đã nghỉ học, anh nên đổi trạng thái sang "Nghỉ học" để giữ lại lịch sử điểm nhé!)`,
+      confirmText: 'Xóa vĩnh viễn',
+      onConfirm: async () => {
+        await supabase.from('submissions').delete().eq('student_id', stu.id);
+        const { error } = await supabase.from('students').delete().eq('id', stu.id);
+        if (error) notify(error.message, 'error');
+        else {
+          notify(`Đã xóa tài khoản ${stu.full_name}!`);
+          fetchAllData();
+        }
+      }
+    });
+  };
+
+  const requestClearAllTestData = () => {
+    setConfirmDialog({
+      title: 'Dọn sạch toàn bộ bài tập & bài nộp test?',
+      message:
+        'Hệ thống sẽ xóa toàn bộ Bài tập, Bài nộp và Thông báo hiện có, nhưng GIỮ NGUYÊN danh sách Lớp học và Tài khoản Học sinh. Anh chắc chắn muốn dọn sạch chứ?',
+      confirmText: 'Dọn sạch bài test',
+      onConfirm: async () => {
+        await supabase.from('submissions').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+        await supabase.from('assignments').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+        await supabase
+          .from('announcements')
+          .delete()
+          .not('message', 'like', '__SC_%');
+        notify('Đã dọn sạch toàn bộ bài tập & bài nộp test!');
+        fetchAllData();
+      }
+    });
+  };
+
   // Xử lý khi Giáo viên tải file Word (.docx) / PDF (.pdf) / Text lên
   const handleTeacherFileUpload = async (e) => {
     const file = e.target.files?.[0];
@@ -490,8 +752,11 @@ export default function App() {
         .join(', ');
       if (autoKeys) setAsgAnswerKey(autoKeys);
 
+      const readingCount = questions.filter((q) => Boolean(q.passage)).length;
       notify(
-        `Đã trích xuất nguyên văn ${questions.length} câu hỏi từ "${file.name}"!`
+        readingCount > 0
+          ? `Đã tách ${questions.length} câu hỏi (gồm ${readingCount} câu bài đọc hiểu)!`
+          : `Đã trích xuất nguyên văn ${questions.length} câu hỏi từ "${file.name}"!`
       );
     } catch (err) {
       notify('Không thể đọc file: ' + err.message, 'error');
@@ -500,7 +765,6 @@ export default function App() {
     }
   };
 
-  // Tùy chọn dùng Gemini AI tách đề khi file lộn xộn
   const handleAiParseQuestions = async () => {
     if (!rawExtractedText.trim()) {
       notify('Anh vui lòng tải file đề lên trước khi dùng AI quét!', 'error');
@@ -523,12 +787,49 @@ export default function App() {
           .map((q) => `${q.number}:${q.correctAnswer}`)
           .join(', ');
         setAsgAnswerKey(autoKeys);
-        notify(`Gemini AI đã tách chuẩn ${aiQuestions.length} câu hỏi!`);
+        notify(`Gemini AI đã tách chuẩn ${aiQuestions.length} câu hỏi & kèm giải thích!`);
       }
     } catch (err) {
       notify(err.message, 'error');
     } finally {
       setIsParsingFile(false);
+    }
+  };
+
+  const handleAiGenerateExplanationsForDraft = async () => {
+    if (parsedQuestions.length === 0) return;
+    if (!geminiApiKey.trim()) {
+      setShowAiKeyInput(true);
+      notify('Anh nhập Gemini API Key để AI tự sinh đáp án & giải thích chi tiết nhé!', 'error');
+      return;
+    }
+
+    localStorage.setItem('sc_gemini_key', geminiApiKey.trim());
+    setIsExplainingAi(true);
+    try {
+      const expMap = await generateExplanationsWithGeminiAI(parsedQuestions, geminiApiKey);
+      setParsedQuestions((prev) => {
+        const next = prev.map((q) => {
+          const item = expMap[String(q.number)];
+          if (!item) return q;
+          return {
+            ...q,
+            correctAnswer: q.correctAnswer || item.correctAnswer || '',
+            explanation: item.explanation || q.explanation || ''
+          };
+        });
+        const autoKeys = next
+          .filter((q) => q.correctAnswer)
+          .map((q) => `${q.number}:${q.correctAnswer}`)
+          .join(', ');
+        setAsgAnswerKey(autoKeys);
+        return next;
+      });
+      notify('AI đã tự động điền đáp án & lời giải thích cho từng câu!');
+    } catch (err) {
+      notify(err.message, 'error');
+    } finally {
+      setIsExplainingAi(false);
     }
   };
 
@@ -551,9 +852,11 @@ export default function App() {
         id: `manual-${Date.now()}`,
         number: prev.length + 1,
         type: 'mcq',
+        passage: '',
         text: '',
         options: { A: '', B: '', C: '', D: '' },
-        correctAnswer: ''
+        correctAnswer: '',
+        explanation: ''
       }
     ]);
   };
@@ -691,7 +994,7 @@ export default function App() {
     localStorage.removeItem('sc_student');
   };
 
-  // Đăng bài tập (hỗ trợ cả file Word/PDF đã tách câu hỏi lẫn nhập tay)
+  // Đăng bài tập mới (kèm thời gian làm bài + bộ câu hỏi)
   const handleCreateAssignment = async (e) => {
     e.preventDefault();
     if (!asgTitle.trim() || !supabase) return;
@@ -717,6 +1020,7 @@ export default function App() {
       const cls = classes.find((c) => c.id === asgClassId) || null;
       const cleanQuestions = parsedQuestions.map((q, idx) => ({
         ...q,
+        type: q.type === 'mcq' ? 'mcq' : 'open',
         number: idx + 1
       }));
 
@@ -728,10 +1032,16 @@ export default function App() {
               .join(', ')
           : asgAnswerKey.trim();
 
+      const timeLimitMinutes =
+        asgTimePreset === 'custom'
+          ? Math.max(0, Number(asgCustomMinutes) || 0)
+          : Number(asgTimePreset) || 0;
+
+      const metaTag = `__SC_META__:${JSON.stringify({ timeLimitMinutes })}`;
       const embeddedRubric =
         cleanQuestions.length > 0
-          ? `${asgRubric.trim()}\n__SC_QUESTIONS__:${JSON.stringify(cleanQuestions)}`
-          : asgRubric.trim();
+          ? `${asgRubric.trim()}\n${metaTag}\n__SC_QUESTIONS__:${JSON.stringify(cleanQuestions)}`
+          : `${asgRubric.trim()}\n${metaTag}`;
 
       const fullPayload = {
         title: asgTitle.trim(),
@@ -818,18 +1128,25 @@ export default function App() {
     }
   };
 
-  const handleSendReminder = async (student) => {
+  const handleSendReminder = async (student, customMsg = '') => {
     if (!supabase) return;
-    await supabase.from('announcements').insert([
+    const msg =
+      customMsg ||
+      `Nhắc nhở: Em ${student.full_name} (${student.student_code}) vui lòng kiểm tra và hoàn thành bài tập đúng hạn nhé!`;
+    const { error } = await supabase.from('announcements').insert([
       {
         target_student_id: student.id,
-        message: `Nhắc nhở: Em ${student.full_name} (${student.student_code}) vui lòng hoàn thành bài tập đúng hạn nhé!`
+        message: msg
       }
     ]);
-    notify(`Đã gửi thông báo nhắc nhở tới ${student.full_name}`);
+    if (error) notify('Lỗi gửi nhắc nhở: ' + error.message, 'error');
+    else {
+      notify(`Đã gửi thông báo nhắc nhở tới ${student.full_name}!`);
+      fetchAllData();
+    }
   };
 
-  // Mở popup chấm bài thủ công và nạp sẵn trạng thái Đúng/Sai từng câu nếu có
+  // Mở popup chấm bài / sửa điểm cho bất kỳ bài nộp nào
   const openManualReviewModal = (sub) => {
     const targetAsg = assignments.find((a) => a.id === sub.assignment_id);
     const qList = getAssignmentQuestions(targetAsg);
@@ -842,8 +1159,8 @@ export default function App() {
     existingBreakdown.forEach((b) => {
       if (b.question) {
         initialMarks[String(b.question)] = b.status;
-        if (b.expected && b.status === 'wrong') {
-          initialNotes[String(b.question)] = b.expected;
+        if (b.explanation || b.expected) {
+          initialNotes[String(b.question)] = b.explanation || b.expected;
         }
       }
     });
@@ -855,7 +1172,7 @@ export default function App() {
         const act = String(ansMap[k] || '').trim().toLowerCase().replace(/\s+/g, '');
         initialMarks[k] = act !== '' && act === exp ? 'correct' : 'wrong';
         if (initialMarks[k] === 'wrong') {
-          initialNotes[k] = String(q.correctAnswer).trim();
+          initialNotes[k] = q.explanation || String(q.correctAnswer).trim();
         }
       }
     });
@@ -873,8 +1190,8 @@ export default function App() {
       setGradeScore('8.5');
     }
 
-    setGradeWeakTopic(targetAsg?.topic || '');
-    setGradeComment('');
+    setGradeWeakTopic((sub.weak_topics || []).join(', ') || targetAsg?.topic || '');
+    setGradeComment(sub.ai_feedback_json?.teacherNote || '');
   };
 
   const handleToggleQuestionMark = (qKey, status, totalCount) => {
@@ -930,26 +1247,28 @@ export default function App() {
       const k = String(q.number);
       const mark = gradeQuestionMarks[k];
       const stuAns = String(ansMap[k] || '(Bỏ trống)').trim();
-      const noteExpected = String(gradeQuestionNotes[k] || q.correctAnswer || '').trim();
+      const noteText = String(gradeQuestionNotes[k] || q.explanation || q.correctAnswer || '').trim();
 
       if (mark === 'correct') {
         correctCount += 1;
         breakdown.push({
           question: k,
           status: 'correct',
-          expected: noteExpected,
-          actual: stuAns
+          expected: q.correctAnswer || noteText,
+          actual: stuAns,
+          explanation: q.explanation || ''
         });
       } else if (mark === 'wrong') {
         breakdown.push({
           question: k,
           status: 'wrong',
-          expected: noteExpected,
-          actual: stuAns
+          expected: q.correctAnswer || '',
+          actual: stuAns,
+          explanation: noteText
         });
         wrongDetails.push(
-          noteExpected
-            ? `Câu ${k}: Em trả lời "${stuAns}" — Đáp án đúng: "${noteExpected}"`
+          noteText
+            ? `Câu ${k}: Em trả lời "${stuAns}" — Đáp án / Giải thích: ${noteText}`
             : `Câu ${k}: Chưa chính xác (Bài làm của em: "${stuAns}")`
         );
       }
@@ -961,7 +1280,7 @@ export default function App() {
 
     const autoSummary =
       breakdown.length > 0
-        ? `Giáo viên đã chấm: Đúng ${correctCount}/${breakdown.length} câu (${scoreNum}/10 điểm).`
+        ? `Kết quả chấm: Đúng ${correctCount}/${breakdown.length} câu (${scoreNum}/10 điểm).`
         : 'Giáo viên đã chấm điểm và nhận xét bài làm.';
 
     const { error } = await supabase
@@ -976,6 +1295,7 @@ export default function App() {
           totalCount: breakdown.length || asgQuestions.length,
           breakdown,
           wrongDetails,
+          teacherNote: gradeComment.trim(),
           summary: gradeComment.trim()
             ? `${gradeComment.trim()} (${autoSummary})`
             : autoSummary
@@ -992,140 +1312,318 @@ export default function App() {
     }
   };
 
-  // Học sinh nộp bài (hỗ trợ cả làm trực tiếp trên web lẫn nộp PDF/nhập tay)
-  const handleStudentSubmit = async (e) => {
-    e.preventDefault();
-    if (!submittingAsg || !currentStudent || !supabase) return;
+  const studentPortalData = useMemo(() => {
+    if (!currentStudent) return null;
+    const mySubs = submissions.filter((s) => s.student_id === currentStudent.id);
+    const subByAsg = {};
+    mySubs.forEach((s) => {
+      if (!subByAsg[s.assignment_id]) subByAsg[s.assignment_id] = s;
+    });
 
-    const questions = getAssignmentQuestions(submittingAsg);
-    const isInteractive = questions.length > 0;
+    const remedialTasks = assignments.filter(
+      (a) => a.is_remedial && a.target_student_id === currentStudent.id
+    );
+    const classTasks = assignments.filter(
+      (a) => !a.is_remedial && (!a.class_id || a.class_id === currentStudent.class_id)
+    );
 
-    if (!isInteractive && !stuAnswerInput.trim() && !stuPdfFile) {
-      notify('Em hãy nhập đáp án hoặc đính kèm file PDF bài làm nhé!', 'error');
+    const urgentTasks = [...remedialTasks, ...classTasks].filter((t) => {
+      if (subByAsg[t.id]) return false;
+      const info = getDeadlineBadgeInfo(t.due_date);
+      return info && info.urgent;
+    });
+
+    const graded = mySubs.filter((s) => s.score !== null && s.score !== undefined);
+    const avgScore =
+      graded.length > 0
+        ? (graded.reduce((a, b) => a + Number(b.score), 0) / graded.length).toFixed(1)
+        : '—';
+
+    const trend = [...graded].reverse().map((sub, idx) => {
+      const asg = assignments.find((a) => a.id === sub.assignment_id);
+      return {
+        label: asg ? `Tuần ${asg.week_number || idx + 1}` : `Bài ${idx + 1}`,
+        score: Number(sub.score)
+      };
+    });
+
+    const weakSet = new Set();
+    mySubs.forEach((s) => (s.weak_topics || []).forEach((t) => weakSet.add(t)));
+
+    const myAnnouncements = announcements.filter(
+      (ann) =>
+        (!ann.target_student_id || ann.target_student_id === currentStudent.id) &&
+        !dismissedAnnIds.includes(ann.id)
+    );
+
+    return {
+      mySubs,
+      subByAsg,
+      remedialTasks,
+      classTasks,
+      urgentTasks,
+      avgScore,
+      trend,
+      weakTopics: Array.from(weakSet),
+      myAnnouncements
+    };
+  }, [currentStudent, submissions, assignments, announcements, dismissedAnnIds]);
+
+
+  // Mở bài làm cho học sinh (Khôi phục nháp tự động + khởi động đồng hồ nếu chưa nộp)
+  const handleOpenStudentAssignment = (task) => {
+    setSubmittingAsg(task);
+    setStuPdfFile(null);
+    setDraftRestoredBanner(false);
+
+    const existingSub = studentPortalData?.subByAsg?.[task.id];
+    const meta = getAssignmentMeta(task);
+
+    if (existingSub) {
+      // Đã nộp rồi -> khóa làm lại, mở chế độ xem kết quả & giải thích
+      setStuInteractiveAnswers(
+        existingSub.answers_json || existingSub.ai_feedback_json?.studentAnswersMap || {}
+      );
+      setStuAnswerInput(existingSub.answer_text || '');
+      setRemainingSeconds(null);
       return;
     }
 
-    setIsSubmitting(true);
+    const draftKey = `sc_draft_${currentStudent.student_code}_${task.id}`;
     try {
-      let fileUrl = null;
-      let fileName = null;
-
-      if (stuPdfFile) {
-        const cleanName = stuPdfFile.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-        const storagePath = `${currentStudent.student_code}/${Date.now()}_${cleanName}`;
-        const { error: uploadErr } = await supabase.storage
-          .from('homework-files')
-          .upload(storagePath, stuPdfFile, { upsert: true });
-
-        if (uploadErr) throw uploadErr;
-        const { data: pubUrl } = supabase.storage.from('homework-files').getPublicUrl(storagePath);
-        fileUrl = pubUrl?.publicUrl || null;
-        fileName = stuPdfFile.name;
-      }
-
-      let finalStatus = 'pending_review';
-      let finalScore = null;
-      let finalWeakTopics = [];
-      let finalFeedbackJson = {
-        summary: 'Đã nộp bài thành công. Đang chờ giáo viên chấm điểm.'
-      };
-      let formattedAnswerText = stuAnswerInput.trim();
-
-      if (isInteractive) {
-        formattedAnswerText = questions
-          .map((q) => `Câu ${q.number}: ${stuInteractiveAnswers[String(q.number)] || '(Bỏ trống)'}`)
-          .join(' | ');
-
-        const graded = gradeInteractiveQuestions(
-          questions,
-          stuInteractiveAnswers,
-          submittingAsg.topic
-        );
-
-        if (graded) {
-          finalScore = graded.score;
-          finalWeakTopics = graded.weakTopics;
-          finalFeedbackJson = {
-            ...graded.feedbackJson,
-            studentAnswersMap: stuInteractiveAnswers
-          };
-          finalStatus = graded.hasUngradedEssay ? 'pending_review' : 'graded';
+      const saved = JSON.parse(localStorage.getItem(draftKey) || 'null');
+      if (saved && (Object.keys(saved.answers || {}).length > 0 || saved.textAnswer)) {
+        setStuInteractiveAnswers(saved.answers || {});
+        setStuAnswerInput(saved.textAnswer || '');
+        setDraftRestoredBanner(true);
+        if (meta.timeLimitMinutes > 0) {
+          setRemainingSeconds(
+            typeof saved.remainingSeconds === 'number'
+              ? saved.remainingSeconds
+              : meta.timeLimitMinutes * 60
+          );
         } else {
-          finalStatus = 'pending_review';
-          finalFeedbackJson = {
-            summary: 'Bài làm đã gửi tới giáo viên để chấm điểm từng câu.',
-            studentAnswersMap: stuInteractiveAnswers
-          };
+          setRemainingSeconds(null);
         }
-      } else {
-        const graded = autoGradeLegacyTextAnswers(
-          submittingAsg.answer_key_text,
-          stuAnswerInput,
-          submittingAsg.topic
-        );
-        if (graded && !stuPdfFile) {
-          finalStatus = 'graded';
-          finalScore = graded.score;
-          finalWeakTopics = graded.weakTopics;
-          finalFeedbackJson = graded.feedbackJson;
-        }
+        return;
       }
-
-      const fullSubPayload = {
-        student_id: currentStudent.id,
-        student_code: currentStudent.student_code,
-        assignment_id: submittingAsg.id,
-        file_url: fileUrl,
-        file_name: fileName,
-        answer_text: formattedAnswerText,
-        answers_json: stuInteractiveAnswers,
-        status: finalStatus,
-        score: finalScore,
-        weak_topics: finalWeakTopics,
-        ai_feedback_json: finalFeedbackJson
-      };
-
-      let { error: insertErr } = await supabase.from('submissions').insert([fullSubPayload]);
-
-      if (insertErr && insertErr.message?.includes('column')) {
-        const { answers_json, ...fallbackSub } = fullSubPayload;
-        const retry = await supabase.from('submissions').insert([fallbackSub]);
-        insertErr = retry.error;
-      }
-
-      if (insertErr) throw insertErr;
-
-      setSubmittingAsg(null);
-      setStuInteractiveAnswers({});
-      setStuAnswerInput('');
-      setStuPdfFile(null);
-
-      notify(
-        finalStatus === 'graded'
-          ? `Chấm tự động hoàn tất! Điểm của em: ${finalScore}/10`
-          : 'Đã nộp bài thành công! Giáo viên sẽ chấm điểm và trả kết quả ngay.'
-      );
-      fetchAllData();
-    } catch (err) {
-      notify('Lỗi nộp bài: ' + err.message, 'error');
-    } finally {
-      setIsSubmitting(false);
+    } catch {
+      // ignore corrupted draft
     }
+
+    setStuInteractiveAnswers({});
+    setStuAnswerInput('');
+    setRemainingSeconds(meta.timeLimitMinutes > 0 ? meta.timeLimitMinutes * 60 : null);
   };
 
-  const filteredStudents = useMemo(() => {
+  // Tự động lưu nháp mỗi khi học sinh chọn đáp án hoặc gõ bài
+  useEffect(() => {
+    if (!submittingAsg || !currentStudent) return;
+    const existingSub = studentPortalData?.subByAsg?.[submittingAsg.id];
+    if (existingSub) return; // Không ghi đè nếu đã nộp
+
+    const draftKey = `sc_draft_${currentStudent.student_code}_${submittingAsg.id}`;
+    const hasContent =
+      Object.keys(stuInteractiveAnswers).length > 0 || Boolean(stuAnswerInput.trim());
+    if (hasContent || typeof remainingSeconds === 'number') {
+      localStorage.setItem(
+        draftKey,
+        JSON.stringify({
+          answers: stuInteractiveAnswers,
+          textAnswer: stuAnswerInput,
+          remainingSeconds,
+          savedAt: Date.now()
+        })
+      );
+    }
+  }, [submittingAsg, currentStudent, stuInteractiveAnswers, stuAnswerInput, remainingSeconds, studentPortalData]);
+
+  // Học sinh nộp bài (hỗ trợ cả tự động thu bài khi hết giờ)
+  const submitStudentWork = useCallback(
+    async (isAutoTimeout = false) => {
+      if (!submittingAsg || !currentStudent || !supabase || isSubmitting) return;
+
+      // Chống nộp trùng 2 lần
+      if (studentPortalData?.subByAsg?.[submittingAsg.id]) {
+        notify('Bài này em đã nộp rồi (Mỗi bài chỉ được nộp 1 lần).', 'error');
+        return;
+      }
+
+      const questions = getAssignmentQuestions(submittingAsg);
+      const isInteractive = questions.length > 0;
+
+      if (!isAutoTimeout && !isInteractive && !stuAnswerInput.trim() && !stuPdfFile) {
+        notify('Em hãy nhập đáp án hoặc đính kèm file PDF bài làm nhé!', 'error');
+        return;
+      }
+
+      setIsSubmitting(true);
+      try {
+        let fileUrl = null;
+        let fileName = null;
+
+        if (stuPdfFile) {
+          const cleanName = stuPdfFile.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+          const storagePath = `${currentStudent.student_code}/${Date.now()}_${cleanName}`;
+          const { error: uploadErr } = await supabase.storage
+            .from('homework-files')
+            .upload(storagePath, stuPdfFile, { upsert: true });
+
+          if (uploadErr) throw uploadErr;
+          const { data: pubUrl } = supabase.storage.from('homework-files').getPublicUrl(storagePath);
+          fileUrl = pubUrl?.publicUrl || null;
+          fileName = stuPdfFile.name;
+        }
+
+        let finalStatus = 'pending_review';
+        let finalScore = null;
+        let finalWeakTopics = [];
+        let finalFeedbackJson = {
+          summary: 'Đã nộp bài thành công. Đang chờ giáo viên chấm điểm.'
+        };
+        let formattedAnswerText = stuAnswerInput.trim();
+
+        if (isInteractive) {
+          formattedAnswerText = questions
+            .map((q) => `Câu ${q.number}: ${stuInteractiveAnswers[String(q.number)] || '(Bỏ trống)'}`)
+            .join(' | ');
+
+          const graded = gradeInteractiveQuestions(
+            questions,
+            stuInteractiveAnswers,
+            submittingAsg.topic
+          );
+
+          if (graded) {
+            finalScore = graded.score;
+            finalWeakTopics = graded.weakTopics;
+            finalFeedbackJson = {
+              ...graded.feedbackJson,
+              studentAnswersMap: stuInteractiveAnswers
+            };
+            finalStatus = graded.hasUngradedOpen ? 'pending_review' : 'graded';
+          } else {
+            finalStatus = 'pending_review';
+            finalFeedbackJson = {
+              summary: 'Bài làm đã gửi tới giáo viên để chấm điểm từng câu.',
+              studentAnswersMap: stuInteractiveAnswers
+            };
+          }
+        } else {
+          const graded = autoGradeLegacyTextAnswers(
+            submittingAsg.answer_key_text,
+            stuAnswerInput,
+            submittingAsg.topic
+          );
+          if (graded && !stuPdfFile) {
+            finalStatus = 'graded';
+            finalScore = graded.score;
+            finalWeakTopics = graded.weakTopics;
+            finalFeedbackJson = graded.feedbackJson;
+          }
+        }
+
+        const fullSubPayload = {
+          student_id: currentStudent.id,
+          student_code: currentStudent.student_code,
+          assignment_id: submittingAsg.id,
+          file_url: fileUrl,
+          file_name: fileName,
+          answer_text: formattedAnswerText,
+          answers_json: stuInteractiveAnswers,
+          status: finalStatus,
+          score: finalScore,
+          weak_topics: finalWeakTopics,
+          ai_feedback_json: finalFeedbackJson
+        };
+
+        let { error: insertErr } = await supabase.from('submissions').insert([fullSubPayload]);
+
+        if (insertErr && insertErr.message?.includes('column')) {
+          const { answers_json, ...fallbackSub } = fullSubPayload;
+          const retry = await supabase.from('submissions').insert([fallbackSub]);
+          insertErr = retry.error;
+        }
+
+        if (insertErr) throw insertErr;
+
+        // Xóa bản nháp sau khi nộp thành công
+        localStorage.removeItem(`sc_draft_${currentStudent.student_code}_${submittingAsg.id}`);
+        setRemainingSeconds(null);
+        setDraftRestoredBanner(false);
+
+        notify(
+          isAutoTimeout
+            ? `Hết giờ làm bài! Hệ thống đã tự động thu bài (${finalScore !== null ? `Điểm: ${finalScore}/10` : 'Chờ GV chấm'}).`
+            : finalStatus === 'graded'
+            ? `Chấm tự động hoàn tất! Điểm của em: ${finalScore}/10 — Xem chi tiết đáp án ngay!`
+            : 'Đã nộp bài thành công! Giáo viên sẽ chấm điểm và trả kết quả ngay.'
+        );
+        await fetchAllData();
+      } catch (err) {
+        notify('Lỗi nộp bài: ' + err.message, 'error');
+      } finally {
+        setIsSubmitting(false);
+      }
+    },
+    [
+      submittingAsg,
+      currentStudent,
+      supabase,
+      isSubmitting,
+      studentPortalData,
+      stuAnswerInput,
+      stuPdfFile,
+      stuInteractiveAnswers,
+      notify,
+      fetchAllData
+    ]
+  );
+
+  // Đồng hồ đếm ngược khi học sinh đang làm bài có giới hạn thời gian
+  useEffect(() => {
+    if (remainingSeconds === null || !submittingAsg || !currentStudent) return;
+    if (studentPortalData?.subByAsg?.[submittingAsg.id]) return;
+
+    if (remainingSeconds <= 0) {
+      submitStudentWork(true);
+      return;
+    }
+
+    const timer = setInterval(() => {
+      setRemainingSeconds((prev) => {
+        if (prev === null) return null;
+        return prev > 0 ? prev - 1 : 0;
+      });
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [remainingSeconds, submittingAsg, currentStudent, studentPortalData, submitStudentWork]);
+
+  // Danh sách học sinh theo lớp & trạng thái Đang học / Nghỉ học
+  const classStudentsAll = useMemo(() => {
     if (selectedClassId === 'all') return students;
     return students.filter((s) => s.class_id === selectedClassId);
   }, [students, selectedClassId]);
 
-  const filteredStudentIds = useMemo(
-    () => new Set(filteredStudents.map((s) => s.id)),
-    [filteredStudents]
+  const activeClassStudents = useMemo(() => {
+    return classStudentsAll.filter(
+      (s) => (studentMetaMap[s.id]?.status || 'active') === 'active'
+    );
+  }, [classStudentsAll, studentMetaMap]);
+
+  const trackedStudentsForStats = useMemo(() => {
+    return includeInactiveInStats ? classStudentsAll : activeClassStudents;
+  }, [includeInactiveInStats, classStudentsAll, activeClassStudents]);
+
+  const trackedStudentIds = useMemo(
+    () => new Set(trackedStudentsForStats.map((s) => s.id)),
+    [trackedStudentsForStats]
   );
 
   const filteredSubmissions = useMemo(() => {
-    return submissions.filter((sub) => filteredStudentIds.has(sub.student_id));
-  }, [submissions, filteredStudentIds]);
+    return submissions.filter((sub) => trackedStudentIds.has(sub.student_id));
+  }, [submissions, trackedStudentIds]);
 
   const pendingReviewSubmissions = useMemo(() => {
     return filteredSubmissions.filter((s) => s.status === 'pending_review');
@@ -1140,17 +1638,218 @@ export default function App() {
     const classAssignments = assignments.filter(
       (a) => !a.is_remedial && (selectedClassId === 'all' || !a.class_id || a.class_id === selectedClassId)
     );
-    const expectedTotal = filteredStudents.length * Math.max(1, classAssignments.length);
+    const expectedTotal = trackedStudentsForStats.length * Math.max(1, classAssignments.length);
     const rate =
       expectedTotal > 0 ? Math.min(100, Math.round((filteredSubmissions.length / expectedTotal) * 100)) : 0;
 
     return {
-      studentCount: filteredStudents.length,
+      studentCount: trackedStudentsForStats.length,
+      inactiveCount: classStudentsAll.length - activeClassStudents.length,
       submissionRate: `${rate}%`,
       avgScore,
       pendingCount: pendingReviewSubmissions.length
     };
-  }, [filteredStudents, filteredSubmissions, assignments, selectedClassId, pendingReviewSubmissions]);
+  }, [
+    trackedStudentsForStats,
+    classStudentsAll,
+    activeClassStudents,
+    filteredSubmissions,
+    assignments,
+    selectedClassId,
+    pendingReviewSubmissions
+  ]);
+
+  // Phân tích phễu: Top câu sai nhiều nhất toàn lớp + Nhóm tốt / Nhóm cần kèm
+  const classFunnelAnalytics = useMemo(() => {
+    const classAsgs = assignments.filter(
+      (a) => !a.is_remedial && (selectedClassId === 'all' || !a.class_id || a.class_id === selectedClassId)
+    );
+
+    const perStudentStats = trackedStudentsForStats.map((stu) => {
+      const stuSubs = filteredSubmissions.filter((s) => s.student_id === stu.id);
+      const graded = stuSubs.filter((s) => s.score !== null && s.score !== undefined);
+      const avg =
+        graded.length > 0
+          ? Number((graded.reduce((a, b) => a + Number(b.score), 0) / graded.length).toFixed(1))
+          : null;
+      const missingCount = Math.max(0, classAsgs.length - stuSubs.length);
+      return {
+        student: stu,
+        submittedCount: stuSubs.length,
+        missingCount,
+        avgScore: avg
+      };
+    });
+
+    const topPerformers = perStudentStats
+      .filter((x) => x.avgScore !== null && x.avgScore >= 8.0)
+      .sort((a, b) => b.avgScore - a.avgScore);
+
+    const needSupport = perStudentStats.filter(
+      (x) => (x.avgScore !== null && x.avgScore < 6.5) || x.missingCount > 0
+    );
+
+    // Thống kê câu sai nhiều nhất trên bài gần nhất / toàn bộ bài
+    const wrongQuestionCounter = {};
+    filteredSubmissions.forEach((sub) => {
+      const asg = assignments.find((a) => a.id === sub.assignment_id);
+      const breakdown = sub.ai_feedback_json?.breakdown || [];
+      breakdown.forEach((b) => {
+        if (b.status === 'wrong') {
+          const key = `${asg?.title || 'Bài tập'} — Câu ${b.question}`;
+          if (!wrongQuestionCounter[key]) {
+            wrongQuestionCounter[key] = {
+              label: key,
+              asgTitle: asg?.title || 'Bài tập',
+              qNum: b.question,
+              wrongCount: 0,
+              totalAttempts: 0
+            };
+          }
+          wrongQuestionCounter[key].wrongCount += 1;
+        }
+        if (b.status === 'wrong' || b.status === 'correct') {
+          const key = `${asg?.title || 'Bài tập'} — Câu ${b.question}`;
+          if (!wrongQuestionCounter[key]) {
+            wrongQuestionCounter[key] = {
+              label: key,
+              asgTitle: asg?.title || 'Bài tập',
+              qNum: b.question,
+              wrongCount: 0,
+              totalAttempts: 0
+            };
+          }
+          wrongQuestionCounter[key].totalAttempts += 1;
+        }
+      });
+    });
+
+    const topMissedQuestions = Object.values(wrongQuestionCounter)
+      .filter((x) => x.wrongCount > 0)
+      .map((x) => ({
+        ...x,
+        wrongRate:
+          x.totalAttempts > 0 ? Math.round((x.wrongCount / x.totalAttempts) * 100) : 100
+      }))
+      .sort((a, b) => b.wrongCount - a.wrongCount || b.wrongRate - a.wrongRate)
+      .slice(0, 6);
+
+    const selectedClassObj = classes.find((c) => c.id === selectedClassId);
+    const classLabel = selectedClassObj ? selectedClassObj.name : 'Tất cả các lớp';
+
+    const autoOverviewReport = [
+      `📊 BÁO CÁO TỔNG QUAN TÌNH HÌNH HỌC TẬP (${classLabel.toUpperCase()})`,
+      `• Sĩ số đang theo dõi: ${trackedStudentsForStats.length} học sinh | Tỷ lệ hoàn thành bài: ${teacherKpis.submissionRate} | Điểm trung bình lớp: ${teacherKpis.avgScore}/10.`,
+      topPerformers.length > 0
+        ? `• 🌟 Nhóm học tốt (≥ 8.0đ): ${topPerformers
+            .slice(0, 5)
+            .map((x) => `${x.student.full_name} (${x.avgScore}đ)`)
+            .join(', ')}.`
+        : `• 🌟 Nhóm học tốt (≥ 8.0đ): Chưa có học sinh đạt mức ≥ 8.0đ ở kỳ này.`,
+      needSupport.length > 0
+        ? `• ⚠️ Nhóm cần đôn đốc / kèm thêm: ${needSupport
+            .slice(0, 6)
+            .map(
+              (x) =>
+                `${x.student.full_name}${
+                  x.avgScore !== null && x.avgScore < 6.5 ? ` (${x.avgScore}đ)` : ''
+                }${x.missingCount > 0 ? ` (thiếu ${x.missingCount} bài)` : ''}`
+            )
+            .join(', ')}.`
+        : `• ✅ Tất cả học sinh đều đã hoàn thành đầy đủ bài tập và đạt mức điểm khá trở lên.`,
+      topMissedQuestions.length > 0
+        ? `• 🎯 Trọng tâm cần chữa trên lớp: ${topMissedQuestions
+            .slice(0, 3)
+            .map((q) => `Câu ${q.qNum} [${q.asgTitle}] (${q.wrongCount}/${q.totalAttempts} em sai)`)
+            .join('; ')}.`
+        : ''
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    return {
+      topPerformers,
+      needSupport,
+      topMissedQuestions,
+      autoOverviewReport
+    };
+  }, [
+    assignments,
+    selectedClassId,
+    trackedStudentsForStats,
+    filteredSubmissions,
+    classes,
+    teacherKpis
+  ]);
+
+  // Phân tích chi tiết từng câu của 1 đề thi bất kỳ (Top câu nhiều học sinh sai nhất)
+  const assignmentAnalyticsData = useMemo(() => {
+    if (!analyticsAssignment) return null;
+    const qList = getAssignmentQuestions(analyticsAssignment);
+    const asgSubs = submissions.filter((s) => s.assignment_id === analyticsAssignment.id);
+    const graded = asgSubs.filter((s) => s.score !== null && s.score !== undefined);
+    const avgScore =
+      graded.length > 0
+        ? (graded.reduce((a, b) => a + Number(b.score), 0) / graded.length).toFixed(1)
+        : '—';
+
+    const questionStats = qList.map((q) => {
+      const qKey = String(q.number);
+      let wrongCount = 0;
+      let correctCount = 0;
+      const choiceCounts = {};
+
+      asgSubs.forEach((sub) => {
+        const ansMap = sub.answers_json || sub.ai_feedback_json?.studentAnswersMap || {};
+        const breakdown = sub.ai_feedback_json?.breakdown || [];
+        const bItem = breakdown.find((b) => String(b.question) === qKey);
+        const stuAns = String(ansMap[qKey] || bItem?.actual || '').trim();
+
+        if (stuAns && stuAns !== '(Bỏ trống)') {
+          choiceCounts[stuAns] = (choiceCounts[stuAns] || 0) + 1;
+        }
+
+        if (bItem) {
+          if (bItem.status === 'wrong') wrongCount += 1;
+          else if (bItem.status === 'correct') correctCount += 1;
+        } else if (q.correctAnswer) {
+          const isRight =
+            stuAns.toLowerCase().replace(/\s+/g, '') ===
+            String(q.correctAnswer).trim().toLowerCase().replace(/\s+/g, '');
+          if (isRight) correctCount += 1;
+          else wrongCount += 1;
+        }
+      });
+
+      const attempts = wrongCount + correctCount;
+      const wrongRate = attempts > 0 ? Math.round((wrongCount / attempts) * 100) : 0;
+
+      // Tìm phương án sai bị chọn nhiều nhất
+      const wrongChoices = Object.entries(choiceCounts)
+        .filter(([opt]) => opt.toUpperCase() !== String(q.correctAnswer || '').trim().toUpperCase())
+        .sort((a, b) => b[1] - a[1]);
+
+      return {
+        ...q,
+        wrongCount,
+        correctCount,
+        attempts,
+        wrongRate,
+        mostCommonWrong: wrongChoices[0] || null
+      };
+    });
+
+    const topMissed = [...questionStats]
+      .filter((q) => q.wrongCount > 0)
+      .sort((a, b) => b.wrongCount - a.wrongCount || b.wrongRate - a.wrongRate);
+
+    return {
+      asgSubs,
+      avgScore,
+      questionStats,
+      topMissed
+    };
+  }, [analyticsAssignment, submissions]);
 
   const teacherChartPoints = useMemo(() => {
     let targetSubs = filteredSubmissions.filter((s) => s.score !== null && s.score !== undefined);
@@ -1175,10 +1874,88 @@ export default function App() {
     }));
   }, [filteredSubmissions, chartStudentFilter, chartTimeMode, assignments]);
 
+  // Tạo nhận xét tự động chi tiết cho từng học sinh (gửi phụ huynh)
+  const buildIndividualStudentReport = useCallback(
+    (stu) => {
+      const stuSubs = submissions.filter((s) => s.student_id === stu.id);
+      const graded = stuSubs.filter((s) => s.score !== null && s.score !== undefined);
+      const chronological = [...graded].reverse();
+      const avg =
+        graded.length > 0
+          ? (graded.reduce((a, b) => a + Number(b.score), 0) / graded.length).toFixed(1)
+          : null;
+
+      const classTasks = assignments.filter(
+        (a) => !a.is_remedial && (!a.class_id || a.class_id === stu.class_id)
+      );
+      const missingTasks = classTasks.filter((t) => !stuSubs.some((s) => s.assignment_id === t.id));
+
+      const weakCounter = {};
+      const allWrongSample = [];
+      stuSubs.forEach((sub) => {
+        const asg = assignments.find((a) => a.id === sub.assignment_id);
+        (sub.weak_topics || []).forEach((t) => {
+          weakCounter[t] = (weakCounter[t] || 0) + 1;
+        });
+        (sub.ai_feedback_json?.breakdown || []).forEach((b) => {
+          if (b.status === 'wrong' && allWrongSample.length < 6) {
+            allWrongSample.push(`Câu ${b.question} (${asg?.title || 'Bài tập'})`);
+          }
+        });
+      });
+      const weakTopicsArr = Object.keys(weakCounter);
+
+      let trajectoryText = '';
+      if (chronological.length >= 2) {
+        const prev = Number(chronological[chronological.length - 2].score);
+        const latest = Number(chronological[chronological.length - 1].score);
+        const diff = Number((latest - prev).toFixed(1));
+        trajectoryText =
+          diff > 0
+            ? `Phong độ tăng +${diff} điểm so với bài trước (${prev}đ → ${latest}đ).`
+            : diff < 0
+            ? `Điểm giảm ${Math.abs(diff)} điểm so với bài trước (${prev}đ → ${latest}đ), cần tập trung rà soát kỹ hơn.`
+            : `Phong độ ổn định ở mức ${latest}đ.`;
+      } else if (chronological.length === 1) {
+        trajectoryText = `Bài gần nhất đạt ${chronological[0].score}/10 điểm.`;
+      }
+
+      const parentMessage = [
+        `📋 BÁO CÁO TÌNH HÌNH HỌC TẬP — EM ${stu.full_name.toUpperCase()} (${stu.student_code})`,
+        `• Lớp: ${stu.class_name || 'Lớp học'} | Số bài đã nộp: ${stuSubs.length}/${classTasks.length} bài | Điểm trung bình: ${
+          avg !== null ? `${avg}/10` : 'Chưa có điểm'
+        }.`,
+        trajectoryText ? `• Tiến độ: ${trajectoryText}` : '',
+        missingTasks.length > 0
+          ? `• Bài chưa hoàn thành: ${missingTasks.map((t) => t.title).join(', ')} (Phụ huynh nhắc em hoàn thành sớm nhé).`
+          : `• Chuyên cần: Em đã hoàn thành đầy đủ các bài tập được giao.`,
+        weakTopicsArr.length > 0 || allWrongSample.length > 0
+          ? `• Phần kiến thức / dạng câu hay mất điểm: ${
+              weakTopicsArr.length > 0 ? weakTopicsArr.join(', ') : ''
+            }${allWrongSample.length > 0 ? ` — Cụ thể sai ở ${allWrongSample.join(', ')}` : ''}.`
+          : `• Nhận xét chuyên môn: Em nắm chắc kiến thức, các dạng bài đều làm tốt.`,
+        avg !== null && Number(avg) >= 8
+          ? `👉 Lời khuyên: Em đang học rất tốt, tiếp tục duy trì phong độ và luyện thêm các bài nâng cao.`
+          : `👉 Lời khuyên: Em cần xem lại phần giải thích các câu sai trên hệ thống và làm đầy đủ bài ôn bổ trợ giáo viên giao.`
+      ]
+        .filter(Boolean)
+        .join('\n');
+
+      return {
+        submissions: stuSubs,
+        avg,
+        missingTasks,
+        weakList: Object.entries(weakCounter).sort((a, b) => b[1] - a[1]),
+        parentMessage
+      };
+    },
+    [submissions, assignments]
+  );
+
   const deepDiveData = useMemo(() => {
     if (!deepDiveStudent) return null;
-    const stuSubs = submissions.filter((s) => s.student_id === deepDiveStudent.id);
-    const graded = stuSubs.filter((s) => s.score !== null && s.score !== undefined);
+    const report = buildIndividualStudentReport(deepDiveStudent);
+    const graded = report.submissions.filter((s) => s.score !== null && s.score !== undefined);
     const trend = [...graded].reverse().map((sub, idx) => {
       const asg = assignments.find((a) => a.id === sub.assignment_id);
       return {
@@ -1187,67 +1964,52 @@ export default function App() {
       };
     });
 
-    const weakCounter = {};
-    stuSubs.forEach((sub) => {
-      (sub.weak_topics || []).forEach((t) => {
-        weakCounter[t] = (weakCounter[t] || 0) + 1;
-      });
-    });
-
     return {
-      submissions: stuSubs,
-      trend,
-      weakList: Object.entries(weakCounter).sort((a, b) => b[1] - a[1])
+      ...report,
+      trend
     };
-  }, [deepDiveStudent, submissions, assignments]);
+  }, [deepDiveStudent, buildIndividualStudentReport, assignments]);
 
-  const studentPortalData = useMemo(() => {
-    if (!currentStudent) return null;
-    const mySubs = submissions.filter((s) => s.student_id === currentStudent.id);
-    const subByAsg = {};
-    mySubs.forEach((s) => {
-      if (!subByAsg[s.assignment_id]) subByAsg[s.assignment_id] = s;
+  const handleDismissAnnouncement = (annId) => {
+    const next = [...dismissedAnnIds, annId];
+    setDismissedAnnIds(next);
+    localStorage.setItem('sc_dismissed_anns', JSON.stringify(next));
+  };
+
+  const handleRemindAllUnsubmitted = async () => {
+    if (!supabase) return;
+    const classAsgs = assignments.filter(
+      (a) => !a.is_remedial && (selectedClassId === 'all' || !a.class_id || a.class_id === selectedClassId)
+    );
+    if (classAsgs.length === 0) {
+      notify('Chưa có bài tập nào được giao.', 'error');
+      return;
+    }
+    const rows = [];
+    activeClassStudents.forEach((stu) => {
+      const stuSubs = submissions.filter((s) => s.student_id === stu.id);
+      const missing = classAsgs.filter((t) => !stuSubs.some((s) => s.assignment_id === t.id));
+      if (missing.length > 0) {
+        rows.push({
+          target_student_id: stu.id,
+          message: `Nhắc nhở: Em ${stu.full_name} còn ${missing.length} bài chưa nộp (${missing
+            .slice(0, 2)
+            .map((m) => m.title)
+            .join(', ')}). Em tranh thủ hoàn thành sớm nhé!`
+        });
+      }
     });
-
-    const remedialTasks = assignments.filter(
-      (a) => a.is_remedial && a.target_student_id === currentStudent.id
-    );
-    const classTasks = assignments.filter(
-      (a) => !a.is_remedial && (!a.class_id || a.class_id === currentStudent.class_id)
-    );
-
-    const graded = mySubs.filter((s) => s.score !== null && s.score !== undefined);
-    const avgScore =
-      graded.length > 0
-        ? (graded.reduce((a, b) => a + Number(b.score), 0) / graded.length).toFixed(1)
-        : '—';
-
-    const trend = [...graded].reverse().map((sub, idx) => {
-      const asg = assignments.find((a) => a.id === sub.assignment_id);
-      return {
-        label: asg ? `Tuần ${asg.week_number || idx + 1}` : `Bài ${idx + 1}`,
-        score: Number(sub.score)
-      };
-    });
-
-    const weakSet = new Set();
-    mySubs.forEach((s) => (s.weak_topics || []).forEach((t) => weakSet.add(t)));
-
-    const myAnnouncements = announcements.filter(
-      (ann) => !ann.target_student_id || ann.target_student_id === currentStudent.id
-    );
-
-    return {
-      mySubs,
-      subByAsg,
-      remedialTasks,
-      classTasks,
-      avgScore,
-      trend,
-      weakTopics: Array.from(weakSet),
-      myAnnouncements
-    };
-  }, [currentStudent, submissions, assignments, announcements]);
+    if (rows.length === 0) {
+      notify('Tất cả học sinh đang học đều đã nộp đủ bài!');
+      return;
+    }
+    const { error } = await supabase.from('announcements').insert(rows);
+    if (error) notify(error.message, 'error');
+    else {
+      notify(`Đã gửi nhắc nhở tới ${rows.length} học sinh chưa nộp đủ bài!`);
+      fetchAllData();
+    }
+  };
 
   const previewNextId = useMemo(() => {
     if (genClassMode === 'new' || classes.length === 0) {
@@ -1276,6 +2038,43 @@ export default function App() {
         </div>
       )}
 
+      {/* HỘP THOẠI XÁC NHẬN XÓA AN TOÀN */}
+      {confirmDialog && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-rose-100 text-rose-600 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="font-bold text-slate-900 text-base">{confirmDialog.title}</h3>
+                <p className="text-xs text-slate-600 mt-1 leading-relaxed">{confirmDialog.message}</p>
+              </div>
+            </div>
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setConfirmDialog(null)}
+                className="px-4 py-2 rounded-xl text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700"
+              >
+                Hủy bỏ
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  const fn = confirmDialog.onConfirm;
+                  setConfirmDialog(null);
+                  await fn();
+                }}
+                className="px-4 py-2 rounded-xl text-xs font-semibold bg-rose-600 hover:bg-rose-700 text-white shadow-sm"
+              >
+                {confirmDialog.confirmText || 'Xác nhận xóa'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <header className="sticky top-0 z-30 bg-white border-b border-slate-200 px-4 sm:px-6 py-3">
         <div className="max-w-7xl mx-auto flex items-center justify-between gap-3">
           <div className="flex items-center gap-3">
@@ -1301,7 +2100,7 @@ export default function App() {
                 </span>
               </div>
               <p className="text-xs text-slate-500 hidden sm:block">
-                Đọc đề Word/PDF tự động • Học sinh làm trực tiếp trên web • Đồng bộ Realtime
+                Đọc đề Word/PDF tự động • Học sinh làm trực tiếp • Báo cáo tự động gửi Phụ huynh
               </p>
             </div>
           </div>
@@ -1352,6 +2151,81 @@ export default function App() {
           </div>
         </div>
       </header>
+
+      {/* MODAL CẬP NHẬT TRẠNG THÁI HỌC SINH (ĐANG HỌC / NGHỈ HỌC) */}
+      {editingStudentStatus && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4">
+          <form
+            onSubmit={handleSaveStudentStatus}
+            className="bg-white rounded-2xl max-w-md w-full p-6 shadow-xl border border-slate-200 space-y-4"
+          >
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div>
+                <h3 className="font-bold text-slate-900">
+                  Trạng thái theo học: {editingStudentStatus.full_name}
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Mã ID: {editingStudentStatus.student_code} • Giữ nguyên toàn bộ điểm lịch sử
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditingStudentStatus(null)}
+                className="text-slate-400 hover:text-slate-600"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setStuStatusDraft('active')}
+                className={`p-3 rounded-xl border text-xs font-bold flex items-center justify-center gap-2 transition ${
+                  stuStatusDraft === 'active'
+                    ? 'bg-emerald-50 border-emerald-500 text-emerald-700'
+                    : 'bg-white border-slate-200 text-slate-600'
+                }`}
+              >
+                <UserCheck className="w-4 h-4" />
+                <span>Đang học</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setStuStatusDraft('inactive')}
+                className={`p-3 rounded-xl border text-xs font-bold flex items-center justify-center gap-2 transition ${
+                  stuStatusDraft === 'inactive'
+                    ? 'bg-amber-50 border-amber-500 text-amber-800'
+                    : 'bg-white border-slate-200 text-slate-600'
+                }`}
+              >
+                <UserX className="w-4 h-4" />
+                <span>Nghỉ học</span>
+              </button>
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                Ghi chú theo dõi (VD: Nghỉ từ 15/11 - Chuyển trường / Bảo lưu)
+              </label>
+              <input
+                type="text"
+                placeholder="Nhập ghi chú ngắn..."
+                value={stuNoteDraft}
+                onChange={(e) => setStuNoteDraft(e.target.value)}
+                className="w-full px-3 py-2 text-sm border border-slate-300 rounded-xl"
+              />
+            </div>
+
+            <button
+              type="submit"
+              className="w-full py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold"
+            >
+              Lưu trạng thái học sinh
+            </button>
+          </form>
+        </div>
+      )}
 
       {/* MODAL GENERATE NHANH ID & PIN */}
       {showQuickGenModal && (
@@ -1611,7 +2485,7 @@ export default function App() {
               <form onSubmit={handleStudentLogin} className="space-y-4">
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Mã ID học sinh theo lớp (VD: 10A1-01)
+                    Mã ID học sinh theo lớp (VD: 10A-01)
                   </label>
                   <input
                     type="text"
@@ -1682,7 +2556,7 @@ export default function App() {
                     : 'text-slate-600 hover:bg-slate-100'
                 }`}
               >
-                1. Tổng quan & Biểu đồ
+                1. Tổng quan & Báo cáo PH
               </button>
               <button
                 onClick={() => setTeacherTab('assignments')}
@@ -1692,7 +2566,7 @@ export default function App() {
                     : 'text-slate-600 hover:bg-slate-100'
                 }`}
               >
-                2. Tạo đề từ Word/PDF & Giao bài
+                2. Tạo đề từ Word/PDF & Phân tích
               </button>
               <button
                 onClick={() => setTeacherTab('students')}
@@ -1702,40 +2576,119 @@ export default function App() {
                     : 'text-slate-600 hover:bg-slate-100'
                 }`}
               >
-                3. Cấp ID Lớp & Học sinh ({students.length})
+                3. Cấp ID & Trạng thái HS ({students.length})
               </button>
             </div>
 
-            <div className="flex items-center gap-2">
-              <Filter className="w-4 h-4 text-slate-400" />
-              <select
-                value={selectedClassId}
-                onChange={(e) => {
-                  setSelectedClassId(e.target.value);
-                  setChartStudentFilter('all');
-                }}
-                className="px-3 py-2 text-sm font-medium bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-indigo-500"
-              >
-                <option value="all">Tất cả các lớp ({classes.length})</option>
-                {classes.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name} ({c.group_name})
-                  </option>
-                ))}
-              </select>
+            <div className="flex flex-wrap items-center gap-2">
+              <label className="inline-flex items-center gap-1.5 text-xs text-slate-600 bg-slate-50 border border-slate-200 px-2.5 py-2 rounded-xl cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={includeInactiveInStats}
+                  onChange={(e) => setIncludeInactiveInStats(e.target.checked)}
+                  className="rounded text-indigo-600"
+                />
+                <span>Tính cả HS nghỉ học (CV/Lịch sử)</span>
+              </label>
+
+              <div className="flex items-center gap-1.5">
+                <Filter className="w-4 h-4 text-slate-400" />
+                <select
+                  value={selectedClassId}
+                  onChange={(e) => {
+                    setSelectedClassId(e.target.value);
+                    setChartStudentFilter('all');
+                  }}
+                  className="px-3 py-2 text-sm font-medium bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-indigo-500"
+                >
+                  <option value="all">Tất cả các lớp ({classes.length})</option>
+                  {classes.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name} ({c.group_name})
+                    </option>
+                  ))}
+                </select>
+              </div>
             </div>
           </div>
 
           {teacherTab === 'overview' && (
             <>
+              {/* KHỐI 1 TRÊN CÙNG: NHẬN XÉT TỔNG QUAN & COPY BÁO CÁO NHANH GỬI PHỤ HUYNH */}
+              <div className="bg-gradient-to-br from-indigo-50 via-white to-emerald-50/40 p-5 rounded-2xl border border-indigo-200 shadow-sm space-y-3">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div>
+                    <h2 className="font-bold text-indigo-950 text-base flex items-center gap-2">
+                      <Award className="w-5 h-5 text-indigo-600" />
+                      <span>Nhận xét tổng quan lớp & Báo cáo nhanh gửi Phụ huynh</span>
+                    </h2>
+                    <p className="text-xs text-slate-600 mt-0.5">
+                      Tự động tổng hợp theo dữ liệu thực tế (Overview → Nhóm tốt / Nhóm cần kèm → Câu sai nhiều)
+                    </p>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleRemindAllUnsubmitted}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-xs font-semibold shadow-sm"
+                    >
+                      <Bell className="w-3.5 h-3.5" />
+                      <span>Nhắc tất cả HS chưa nộp</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const textToCopy =
+                          customTeacherOverviewNote.trim() ||
+                          classFunnelAnalytics.autoOverviewReport;
+                        navigator.clipboard.writeText(textToCopy);
+                        notify('Đã copy báo cáo tổng quan — Dán (Ctrl+V) gửi nhóm Phụ huynh ngay!');
+                      }}
+                      className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold shadow-sm"
+                    >
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>Copy Báo cáo gửi nhóm PH</span>
+                    </button>
+                  </div>
+                </div>
+
+                <textarea
+                  rows={5}
+                  value={
+                    customTeacherOverviewNote !== ''
+                      ? customTeacherOverviewNote
+                      : classFunnelAnalytics.autoOverviewReport
+                  }
+                  onChange={(e) => setCustomTeacherOverviewNote(e.target.value)}
+                  className="w-full p-3.5 text-xs sm:text-sm bg-white/90 border border-indigo-200 rounded-xl text-slate-800 leading-relaxed focus:ring-2 focus:ring-indigo-500 outline-none"
+                />
+                {customTeacherOverviewNote !== '' && (
+                  <div className="flex justify-end">
+                    <button
+                      type="button"
+                      onClick={() => setCustomTeacherOverviewNote('')}
+                      className="text-[11px] text-indigo-600 hover:underline font-semibold"
+                    >
+                      ↺ Khôi phục nhận xét tự động theo dữ liệu mới nhất
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* KHỐI 2: 4 KPI TỔNG QUAN */}
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
                 <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm">
                   <div className="flex items-center justify-between text-slate-500 text-xs font-medium mb-2">
-                    <span>Sĩ số đang theo dõi</span>
+                    <span>{includeInactiveInStats ? 'Tổng HS (Cả đã nghỉ)' : 'Sĩ số đang học'}</span>
                     <Users className="w-4 h-4 text-indigo-600" />
                   </div>
                   <div className="text-2xl font-bold text-slate-900">{teacherKpis.studentCount}</div>
-                  <div className="text-xs text-slate-400 mt-1">Học sinh phân mã theo lớp</div>
+                  <div className="text-xs text-slate-400 mt-1">
+                    {teacherKpis.inactiveCount > 0
+                      ? `Ngoài ra có ${teacherKpis.inactiveCount} em đã nghỉ học`
+                      : '100% đang theo học'}
+                  </div>
                 </div>
 
                 <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm">
@@ -1766,6 +2719,7 @@ export default function App() {
                 </div>
               </div>
 
+              {/* BÀI CHỜ CHẤM */}
               {pendingReviewSubmissions.length > 0 && (
                 <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4">
                   <div className="flex items-center gap-2 font-bold text-amber-900 text-sm mb-3">
@@ -1786,16 +2740,22 @@ export default function App() {
                               {stu?.full_name || sub.student_code} ({sub.student_code})
                             </div>
                             <div className="text-xs text-slate-500 truncate">{asg?.title || 'Bài tập'}</div>
-                            {sub.file_name && (
-                              <div className="text-[11px] text-indigo-600 truncate mt-0.5">{sub.file_name}</div>
-                            )}
                           </div>
-                          <button
-                            onClick={() => openManualReviewModal(sub)}
-                            className="shrink-0 px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-xs font-semibold"
-                          >
-                            Chấm bài
-                          </button>
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <button
+                              onClick={() => openManualReviewModal(sub)}
+                              className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-xs font-semibold"
+                            >
+                              Chấm bài
+                            </button>
+                            <button
+                              onClick={() => requestDeleteSubmission(sub, stu?.full_name)}
+                              title="Xóa lượt nộp này"
+                              className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
                         </div>
                       );
                     })}
@@ -1803,6 +2763,85 @@ export default function App() {
                 </div>
               )}
 
+              {/* KHỐI 3: CLASS DEEP-DIVE (NHÓM TỐT / NHÓM CẦN KÈM / TOP CÂU SAI NHIỀU NHẤT) */}
+              <div className="grid lg:grid-cols-3 gap-4">
+                <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm space-y-2.5">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-emerald-700 flex items-center gap-1.5">
+                    <CheckCircle2 className="w-4 h-4" />
+                    <span>Nhóm học tốt (Điểm TB ≥ 8.0)</span>
+                  </h3>
+                  {classFunnelAnalytics.topPerformers.length === 0 ? (
+                    <p className="text-xs text-slate-400">Chưa có học sinh đạt mức ≥ 8.0</p>
+                  ) : (
+                    <div className="space-y-1.5 max-h-40 overflow-y-auto">
+                      {classFunnelAnalytics.topPerformers.map((item) => (
+                        <div
+                          key={item.student.id}
+                          className="flex items-center justify-between text-xs bg-emerald-50/70 px-3 py-1.5 rounded-lg"
+                        >
+                          <span className="font-semibold text-slate-800">
+                            {item.student.full_name} ({item.student.student_code})
+                          </span>
+                          <span className="font-bold text-emerald-700">{item.avgScore}đ</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm space-y-2.5">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-rose-700 flex items-center gap-1.5">
+                    <AlertTriangle className="w-4 h-4" />
+                    <span>Cần kèm thêm / Chưa nộp đủ bài</span>
+                  </h3>
+                  {classFunnelAnalytics.needSupport.length === 0 ? (
+                    <p className="text-xs text-slate-400">Tất cả các em đều đạt yêu cầu!</p>
+                  ) : (
+                    <div className="space-y-1.5 max-h-40 overflow-y-auto">
+                      {classFunnelAnalytics.needSupport.map((item) => (
+                        <div
+                          key={item.student.id}
+                          className="flex items-center justify-between text-xs bg-rose-50/70 px-3 py-1.5 rounded-lg"
+                        >
+                          <span className="font-semibold text-slate-800 truncate pr-2">
+                            {item.student.full_name}
+                          </span>
+                          <span className="text-rose-700 font-bold shrink-0">
+                            {item.avgScore !== null && item.avgScore < 6.5 ? `${item.avgScore}đ • ` : ''}
+                            {item.missingCount > 0 ? `Thiếu ${item.missingCount} bài` : 'Điểm thấp'}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm space-y-2.5">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-indigo-700 flex items-center gap-1.5">
+                    <BarChart3 className="w-4 h-4" />
+                    <span>Top câu hỏi cả lớp sai nhiều nhất</span>
+                  </h3>
+                  {classFunnelAnalytics.topMissedQuestions.length === 0 ? (
+                    <p className="text-xs text-slate-400">Chưa ghi nhận câu sai nào</p>
+                  ) : (
+                    <div className="space-y-1.5 max-h-40 overflow-y-auto">
+                      {classFunnelAnalytics.topMissedQuestions.map((q, idx) => (
+                        <div
+                          key={idx}
+                          className="flex items-center justify-between text-xs bg-indigo-50/70 px-3 py-1.5 rounded-lg gap-2"
+                        >
+                          <span className="font-medium text-slate-800 truncate">{q.label}</span>
+                          <span className="font-bold text-rose-600 shrink-0">
+                            {q.wrongCount}/{q.totalAttempts} sai ({q.wrongRate}%)
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* BIỂU ĐỒ */}
               <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
                   <div>
@@ -1818,7 +2857,7 @@ export default function App() {
                       className="px-3 py-1.5 text-xs font-medium bg-slate-50 border border-slate-200 rounded-lg"
                     >
                       <option value="all">Trung bình cả lớp</option>
-                      {filteredStudents.map((s) => (
+                      {trackedStudentsForStats.map((s) => (
                         <option key={s.id} value={s.id}>
                           {s.student_code} — {s.full_name}
                         </option>
@@ -1848,29 +2887,32 @@ export default function App() {
                 <TrendLineChart points={teacherChartPoints} />
               </div>
 
+              {/* KHỐI 4: BẢNG INDIVIDUAL DEEP-DIVE TỪNG HỌC SINH */}
               <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-                <div className="p-4 sm:p-5 border-b border-slate-200">
-                  <h2 className="font-bold text-slate-900">Theo dõi chi tiết từng học sinh</h2>
-                  <p className="text-xs text-slate-500">
-                    Bấm <strong>Deep-dive</strong> để xem phần yếu và giao bài ôn riêng, hoặc <strong>Copy ID</strong> gửi học sinh
-                  </p>
+                <div className="p-4 sm:p-5 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div>
+                    <h2 className="font-bold text-slate-900">Theo dõi chi tiết & Báo cáo từng học sinh</h2>
+                    <p className="text-xs text-slate-500">
+                      Bấm <strong>Copy PH</strong> để dán ngay nhận xét gửi riêng phụ huynh, hoặc <strong>Deep-dive</strong> để xem từng bài & sửa điểm
+                    </p>
+                  </div>
                 </div>
 
                 <div className="overflow-x-auto">
                   <table className="w-full text-left border-collapse">
                     <thead>
                       <tr className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600">
-                        <th className="py-3 px-4">Mã ID (Theo lớp)</th>
+                        <th className="py-3 px-4">Mã ID</th>
                         <th className="py-3 px-4">Họ và tên</th>
-                        <th className="py-3 px-4">Lớp</th>
-                        <th className="py-3 px-4">Bài đã nộp</th>
+                        <th className="py-3 px-4">Trạng thái</th>
+                        <th className="py-3 px-4">Đã nộp</th>
                         <th className="py-3 px-4">Điểm TB</th>
                         <th className="py-3 px-4">Phần đang yếu</th>
                         <th className="py-3 px-4 text-right">Thao tác</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 text-sm">
-                      {filteredStudents.map((stu) => {
+                      {classStudentsAll.map((stu) => {
                         const mySubs = submissions.filter((s) => s.student_id === stu.id);
                         const graded = mySubs.filter((s) => s.score !== null && s.score !== undefined);
                         const avg =
@@ -1881,15 +2923,49 @@ export default function App() {
                         mySubs.forEach((s) => (s.weak_topics || []).forEach((w) => weakSet.add(w)));
                         const weakArr = Array.from(weakSet);
 
+                        const meta = studentMetaMap[stu.id] || { status: 'active', note: '' };
+                        const isInactive = meta.status === 'inactive';
+
                         return (
-                          <tr key={stu.id} className="hover:bg-slate-50/80 transition">
+                          <tr
+                            key={stu.id}
+                            className={`transition ${
+                              isInactive ? 'bg-slate-50/60 opacity-75' : 'hover:bg-slate-50/80'
+                            }`}
+                          >
                             <td className="py-3 px-4">
                               <span className="font-mono font-bold text-indigo-600 text-xs bg-indigo-50 px-2 py-1 rounded">
                                 {stu.student_code}
                               </span>
                             </td>
-                            <td className="py-3 px-4 font-semibold text-slate-900">{stu.full_name}</td>
-                            <td className="py-3 px-4 text-xs text-slate-500">{stu.class_name}</td>
+                            <td className="py-3 px-4">
+                              <div className="font-semibold text-slate-900">{stu.full_name}</div>
+                              <div className="text-[11px] text-slate-400">{stu.class_name}</div>
+                            </td>
+                            <td className="py-3 px-4">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setEditingStudentStatus(stu);
+                                  setStuStatusDraft(meta.status || 'active');
+                                  setStuNoteDraft(meta.note || '');
+                                }}
+                                title="Bấm để đổi trạng thái Đang học / Nghỉ học"
+                                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold border ${
+                                  isInactive
+                                    ? 'bg-amber-50 text-amber-800 border-amber-200'
+                                    : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                }`}
+                              >
+                                <span>{isInactive ? 'Nghỉ học' : 'Đang học'}</span>
+                                <Edit3 className="w-2.5 h-2.5" />
+                              </button>
+                              {meta.note && (
+                                <div className="text-[11px] text-slate-500 mt-0.5 max-w-[140px] truncate">
+                                  {meta.note}
+                                </div>
+                              )}
+                            </td>
                             <td className="py-3 px-4 text-xs font-medium">{mySubs.length} bài</td>
                             <td className="py-3 px-4">
                               <span
@@ -1924,10 +3000,15 @@ export default function App() {
                             </td>
                             <td className="py-3 px-4 text-right space-x-1.5 whitespace-nowrap">
                               <button
-                                onClick={() => copyInviteMessage(stu)}
-                                className="px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200"
+                                onClick={() => {
+                                  const rep = buildIndividualStudentReport(stu);
+                                  navigator.clipboard.writeText(rep.parentMessage);
+                                  notify(`Đã copy báo cáo nhận xét gửi Phụ huynh em ${stu.full_name}!`);
+                                }}
+                                title="Copy tin nhắn báo cáo gửi Phụ huynh (Ctrl+V)"
+                                className="px-2.5 py-1.5 rounded-lg text-xs font-semibold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200"
                               >
-                                Copy ID
+                                Copy PH
                               </button>
                               <button
                                 onClick={() => handleSendReminder(stu)}
@@ -1958,7 +3039,7 @@ export default function App() {
             </>
           )}
 
-          {/* TAB 2: TẠO ĐỀ TỪ WORD / PDF & CHỈNH SỬA TRỰC QUAN */}
+          {/* TAB 2: TẠO ĐỀ TỪ WORD / PDF & PHÂN TÍCH ĐỀ */}
           {teacherTab === 'assignments' && (
             <div className="grid lg:grid-cols-12 gap-6">
               <form
@@ -1972,12 +3053,11 @@ export default function App() {
                       <span>Tải file Word (.docx) hoặc PDF (.pdf) thành đề tương tác</span>
                     </h2>
                     <p className="text-xs text-slate-500 mt-0.5">
-                      Tự động giữ nguyên văn 100% câu hỏi • Tự nhận diện đáp án cuối file hoặc chữ in đậm (Không cần AI)
+                      Tự nhận diện trắc nghiệm A/B/C/D, điền đáp án / tự luận & cả đoạn văn bài đọc dài
                     </p>
                   </div>
                 </div>
 
-                {/* VÙNG KÉO THẢ FILE WORD / PDF */}
                 <div>
                   <label className="flex flex-col items-center justify-center p-5 border-2 border-dashed border-indigo-300 rounded-2xl bg-indigo-50/40 hover:bg-indigo-50 cursor-pointer transition text-center">
                     <Upload className="w-7 h-7 text-indigo-600 mb-1.5" />
@@ -1989,7 +3069,7 @@ export default function App() {
                         : 'Bấm để chọn file Đề bài (.DOCX Word, .PDF hoặc .TXT)'}
                     </span>
                     <span className="text-xs text-slate-500 mt-1">
-                      Hỗ trợ đề trắc nghiệm A/B/C/D, điền đáp án ngắn và đề tự luận
+                      Giữ nguyên trình tự đề gốc • Tự tách bài đọc hiểu chung cho nhóm câu hỏi
                     </span>
                     <input
                       type="file"
@@ -2006,7 +3086,7 @@ export default function App() {
                     <input
                       type="text"
                       required
-                      placeholder="VD: Đề kiểm tra Tuần 3 - Hàm số"
+                      placeholder="VD: Mini Test Unit 4"
                       value={asgTitle}
                       onChange={(e) => setAsgTitle(e.target.value)}
                       className="w-full px-3 py-2 text-sm border border-slate-300 rounded-xl"
@@ -2029,7 +3109,7 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="grid grid-cols-3 gap-3">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                   <div>
                     <label className="block text-xs font-semibold text-slate-700 mb-1">Tuần học</label>
                     <input
@@ -2044,7 +3124,7 @@ export default function App() {
                     <label className="block text-xs font-semibold text-slate-700 mb-1">Chuyên đề</label>
                     <input
                       type="text"
-                      placeholder="VD: Đại số"
+                      placeholder="VD: Tiếng Anh"
                       value={asgTopic}
                       onChange={(e) => setAsgTopic(e.target.value)}
                       className="w-full px-3 py-2 text-sm border border-slate-300 rounded-xl"
@@ -2059,7 +3139,42 @@ export default function App() {
                       className="w-full px-3 py-2 text-sm border border-slate-300 rounded-xl"
                     />
                   </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      Thời gian làm bài
+                    </label>
+                    <select
+                      value={asgTimePreset}
+                      onChange={(e) => setAsgTimePreset(e.target.value)}
+                      className="w-full px-2.5 py-2 text-sm border border-slate-300 rounded-xl bg-white"
+                    >
+                      <option value="0">Không giới hạn</option>
+                      <option value="15">15 phút</option>
+                      <option value="30">30 phút</option>
+                      <option value="45">45 phút</option>
+                      <option value="60">60 phút</option>
+                      <option value="custom">Tự nhập số phút...</option>
+                    </select>
+                  </div>
                 </div>
+
+                {asgTimePreset === 'custom' && (
+                  <div className="flex items-center gap-3 p-3 rounded-xl bg-indigo-50/70 border border-indigo-200">
+                    <Timer className="w-4 h-4 text-indigo-600 shrink-0" />
+                    <label className="text-xs font-semibold text-indigo-950">
+                      Nhập số phút làm bài tùy chọn:
+                    </label>
+                    <input
+                      type="number"
+                      min="1"
+                      max="300"
+                      value={asgCustomMinutes}
+                      onChange={(e) => setAsgCustomMinutes(e.target.value)}
+                      className="w-24 px-3 py-1.5 text-sm font-bold bg-white border border-indigo-300 rounded-lg"
+                    />
+                    <span className="text-xs text-slate-600">phút (Hết giờ tự động thu bài)</span>
+                  </div>
+                )}
 
                 {/* BẢNG XEM TRƯỚC & CHỐT ĐÁP ÁN TỪNG CÂU */}
                 {parsedQuestions.length > 0 && (
@@ -2070,10 +3185,21 @@ export default function App() {
                           Bộ câu hỏi đã xuất sang Web ({parsedQuestions.length} câu)
                         </h3>
                         <p className="text-[11px] text-slate-500">
-                          Bấm chọn A/B/C/D để gắn đáp án tự chấm — hoặc bỏ trống nếu muốn giáo viên tự chấm điểm
+                          Có đáp án → Tự động chấm • Để trống đáp án → Giáo viên tự chấm
                         </p>
                       </div>
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <button
+                          type="button"
+                          disabled={isExplainingAi}
+                          onClick={handleAiGenerateExplanationsForDraft}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-semibold hover:bg-emerald-100"
+                        >
+                          <Sparkles className="w-3.5 h-3.5" />
+                          <span>
+                            {isExplainingAi ? 'AI đang giải...' : 'AI tạo đáp án & giải thích'}
+                          </span>
+                        </button>
                         {rawExtractedText && (
                           <button
                             type="button"
@@ -2081,7 +3207,7 @@ export default function App() {
                             className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-purple-50 text-purple-700 border border-purple-200 text-xs font-semibold hover:bg-purple-100"
                           >
                             <Sparkles className="w-3.5 h-3.5" />
-                            <span>Quét lại bằng AI</span>
+                            <span>Quét lại AI</span>
                           </button>
                         )}
                         <button
@@ -2106,10 +3232,10 @@ export default function App() {
                         />
                         <button
                           type="button"
-                          onClick={handleAiParseQuestions}
+                          onClick={handleAiGenerateExplanationsForDraft}
                           className="px-3 py-1.5 rounded-lg bg-purple-600 text-white text-xs font-semibold"
                         >
-                          Chạy AI
+                          Lưu & Chạy AI
                         </button>
                       </div>
                     )}
@@ -2126,7 +3252,7 @@ export default function App() {
                                 Câu {idx + 1}
                               </span>
                               <select
-                                value={q.type}
+                                value={q.type === 'mcq' ? 'mcq' : 'open'}
                                 onChange={(e) =>
                                   updateParsedQuestion(idx, {
                                     type: e.target.value,
@@ -2136,15 +3262,14 @@ export default function App() {
                                 className="px-2 py-1 text-xs bg-white border border-slate-300 rounded-lg font-medium"
                               >
                                 <option value="mcq">Trắc nghiệm (A/B/C/D)</option>
-                                <option value="short">Trả lời ngắn (Tự chấm)</option>
-                                <option value="essay">Tự luận (GV tự chấm)</option>
+                                <option value="open">Điền đáp án / Tự luận</option>
                               </select>
                             </div>
 
                             <div className="flex items-center gap-2">
                               {q.correctAnswer ? (
                                 <span className="text-[11px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded">
-                                  Đáp án: {q.correctAnswer}
+                                  Tự chấm: {q.correctAnswer}
                                 </span>
                               ) : (
                                 <span className="text-[11px] font-medium text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded">
@@ -2163,6 +3288,13 @@ export default function App() {
                             </div>
                           </div>
 
+                          {q.passage && (
+                            <div className="p-2 rounded-lg bg-indigo-50/70 border border-indigo-200 text-[11px] text-indigo-950">
+                              <span className="font-bold">📖 Bài đọc chung: </span>
+                              <span className="line-clamp-2">{q.passage}</span>
+                            </div>
+                          )}
+
                           <textarea
                             rows={2}
                             value={q.text}
@@ -2171,7 +3303,7 @@ export default function App() {
                             className="w-full px-3 py-1.5 text-xs bg-white border border-slate-300 rounded-lg"
                           />
 
-                          {q.type === 'mcq' && (
+                          {q.type === 'mcq' ? (
                             <div className="grid sm:grid-cols-2 gap-2">
                               {['A', 'B', 'C', 'D'].map((opt) => {
                                 const isSelected = q.correctAnswer === opt;
@@ -2215,19 +3347,27 @@ export default function App() {
                                 );
                               })}
                             </div>
-                          )}
-
-                          {q.type === 'short' && (
+                          ) : (
                             <input
                               type="text"
                               value={q.correctAnswer || ''}
                               onChange={(e) =>
                                 updateParsedQuestion(idx, { correctAnswer: e.target.value })
                               }
-                              placeholder="Nhập đáp án ngắn chuẩn để tự động so khớp (VD: 12.5 hoặc x=2)..."
+                              placeholder="Nhập đáp án chuẩn để tự động chấm (Hoặc để trống nếu giáo viên tự chấm tay)..."
                               className="w-full px-3 py-1.5 text-xs bg-white border border-emerald-300 rounded-lg"
                             />
                           )}
+
+                          <input
+                            type="text"
+                            value={q.explanation || ''}
+                            onChange={(e) =>
+                              updateParsedQuestion(idx, { explanation: e.target.value })
+                            }
+                            placeholder="💡 Giải thích đáp án (Hiện tự động cho học sinh xem khi làm sai câu này)..."
+                            className="w-full px-3 py-1.5 text-xs bg-white border border-slate-200 rounded-lg text-slate-600"
+                          />
                         </div>
                       ))}
                     </div>
@@ -2278,9 +3418,15 @@ export default function App() {
 
               {/* DANH SÁCH ĐỀ ĐÃ GIAO */}
               <div className="lg:col-span-5 space-y-3">
-                <h2 className="font-bold text-slate-900">Danh sách bài tập đã giao ({assignments.length})</h2>
+                <div className="flex items-center justify-between">
+                  <h2 className="font-bold text-slate-900">
+                    Danh sách bài tập đã giao ({assignments.length})
+                  </h2>
+                </div>
                 {assignments.map((a) => {
                   const qList = getAssignmentQuestions(a);
+                  const meta = getAssignmentMeta(a);
+                  const subCount = submissions.filter((s) => s.assignment_id === a.id).length;
                   const hasKeys =
                     Boolean(a.answer_key_text) || qList.some((q) => Boolean(q.correctAnswer));
                   return (
@@ -2290,7 +3436,7 @@ export default function App() {
                     >
                       <div>
                         <div className="flex items-center justify-between gap-2">
-                          <div className="flex items-center gap-2">
+                          <div className="flex flex-wrap items-center gap-1.5">
                             {a.is_remedial ? (
                               <span className="px-2 py-0.5 rounded-md bg-rose-50 text-rose-700 text-[11px] font-bold">
                                 Ôn bổ trợ riêng
@@ -2301,41 +3447,61 @@ export default function App() {
                               </span>
                             )}
                             <span className="text-xs text-slate-500">{a.class_name}</span>
+                            {meta.timeLimitMinutes > 0 && (
+                              <span className="px-2 py-0.5 rounded-md bg-amber-50 text-amber-800 text-[11px] font-bold">
+                                ⏱ {meta.timeLimitMinutes}p
+                              </span>
+                            )}
                           </div>
-                          {qList.length > 0 && (
-                            <span className="px-2 py-0.5 rounded-md bg-indigo-50 text-indigo-700 text-[11px] font-bold">
-                              {qList.length} câu trên Web
-                            </span>
-                          )}
+                          <button
+                            type="button"
+                            onClick={() => requestDeleteAssignment(a)}
+                            title="Xóa bài tập này"
+                            className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
                         </div>
                         <h3 className="font-bold text-slate-900 mt-1.5">{a.title}</h3>
                         <p className="text-xs text-slate-500 mt-0.5">
-                          Chuyên đề: <strong>{a.topic || 'Tổng hợp'}</strong> • Hạn: {a.due_date || 'Mở'}
+                          Chuyên đề: <strong>{a.topic || 'Tổng hợp'}</strong> • Hạn: {a.due_date || 'Mở'} •{' '}
+                          <strong className="text-indigo-600">{subCount} bài nộp</strong>
                         </p>
                       </div>
 
-                      <div className="flex items-center justify-between pt-2 border-t border-slate-100 text-xs">
+                      <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-100 text-xs">
                         {hasKeys ? (
-                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-50 text-emerald-700 font-medium">
-                            <Check className="w-3.5 h-3.5" /> Tự động chấm theo đáp án
+                          <span className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-emerald-50 text-emerald-700 font-medium">
+                            <Check className="w-3.5 h-3.5" /> Tự chấm
                           </span>
                         ) : (
-                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-50 text-amber-700 font-medium">
-                            Giáo viên chấm điểm
+                          <span className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-amber-50 text-amber-700 font-medium">
+                            GV chấm
                           </span>
                         )}
 
-                        {(a.source_file_url || a.answer_key_url) && (
-                          <a
-                            href={a.source_file_url || a.answer_key_url}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="inline-flex items-center gap-1 text-indigo-600 hover:underline font-semibold"
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setAnalyticsAssignment(a)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-semibold"
                           >
-                            <span>File đề gốc</span>
-                            <ExternalLink className="w-3 h-3" />
-                          </a>
-                        )}
+                            <BarChart3 className="w-3.5 h-3.5" />
+                            <span>Top câu sai & Bài nộp</span>
+                          </button>
+
+                          {(a.source_file_url || a.answer_key_url) && (
+                            <a
+                              href={a.source_file_url || a.answer_key_url}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="inline-flex items-center gap-1 text-indigo-600 hover:underline font-semibold"
+                            >
+                              <span>Đề gốc</span>
+                              <ExternalLink className="w-3 h-3" />
+                            </a>
+                          )}
+                        </div>
                       </div>
                     </div>
                   );
@@ -2344,7 +3510,7 @@ export default function App() {
             </div>
           )}
 
-          {/* TAB 3: QUẢN LÝ ID LỚP & HỌC SINH */}
+          {/* TAB 3: QUẢN LÝ ID LỚP & TRẠNG THÁI HỌC SINH */}
           {teacherTab === 'students' && (
             <div className="grid lg:grid-cols-5 gap-6">
               <div className="lg:col-span-2 bg-white p-5 rounded-2xl border border-slate-200 shadow-sm space-y-4 h-fit">
@@ -2438,62 +3604,79 @@ export default function App() {
                   </button>
                 </form>
 
-                {generatedCredentials.length > 0 && (
-                  <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 space-y-2">
-                    <div className="text-xs font-bold text-emerald-900">Tài khoản vừa tạo xong:</div>
-                    {generatedCredentials.map((stu) => (
-                      <div
-                        key={stu.student_code}
-                        className="bg-white p-2.5 rounded-lg border border-emerald-200 flex items-center justify-between text-xs"
-                      >
-                        <div>
-                          <div className="font-bold text-slate-900">{stu.full_name}</div>
-                          <div className="text-slate-600">
-                            ID: <strong className="font-mono text-indigo-600">{stu.student_code}</strong> • PIN:{' '}
-                            <strong className="font-mono text-emerald-700">{stu.pin_code}</strong>
-                          </div>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => copyInviteMessage(stu)}
-                          className="px-2.5 py-1.5 rounded-lg bg-indigo-600 text-white font-semibold flex items-center gap-1"
-                        >
-                          <Copy className="w-3 h-3" /> Copy
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
+                <div className="pt-3 border-t border-slate-100">
+                  <button
+                    type="button"
+                    onClick={requestClearAllTestData}
+                    className="w-full py-2 rounded-xl border border-rose-200 bg-rose-50/70 hover:bg-rose-100 text-rose-700 text-xs font-semibold flex items-center justify-center gap-1.5"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Dọn sạch toàn bộ bài tập & bài nộp test</span>
+                  </button>
+                </div>
               </div>
 
               <div className="lg:col-span-3 bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
                 <h2 className="font-bold text-slate-900 mb-3">
-                  Danh sách ID & Mật khẩu học sinh ({students.length})
+                  Danh sách học sinh ({students.length}) — Bấm trạng thái để đổi Đang học / Nghỉ học
                 </h2>
-                <div className="max-h-[460px] overflow-y-auto divide-y divide-slate-100">
-                  {students.map((s) => (
-                    <div key={s.id} className="py-2.5 flex items-center justify-between gap-2 text-xs">
-                      <div>
-                        <span className="font-mono font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded mr-2">
-                          {s.student_code}
-                        </span>
-                        <span className="font-semibold text-slate-900">{s.full_name}</span>
-                        <span className="text-slate-400 ml-2">({s.class_name})</span>
+                <div className="max-h-[480px] overflow-y-auto divide-y divide-slate-100">
+                  {students.map((s) => {
+                    const meta = studentMetaMap[s.id] || { status: 'active', note: '' };
+                    const isInactive = meta.status === 'inactive';
+                    return (
+                      <div
+                        key={s.id}
+                        className="py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs"
+                      >
+                        <div>
+                          <span className="font-mono font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded mr-2">
+                            {s.student_code}
+                          </span>
+                          <span className="font-semibold text-slate-900">{s.full_name}</span>
+                          <span className="text-slate-400 ml-2">({s.class_name})</span>
+                          {meta.note && (
+                            <span className="ml-2 text-[11px] text-amber-700 italic">• {meta.note}</span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-slate-600">
+                            PIN: <strong className="font-mono text-slate-900">{s.pin_code}</strong>
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEditingStudentStatus(s);
+                              setStuStatusDraft(meta.status || 'active');
+                              setStuNoteDraft(meta.note || '');
+                            }}
+                            className={`px-2 py-1 rounded-lg font-bold border ${
+                              isInactive
+                                ? 'bg-amber-50 text-amber-800 border-amber-200'
+                                : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                            }`}
+                          >
+                            {isInactive ? 'Nghỉ học' : 'Đang học'}
+                          </button>
+                          <button
+                            onClick={() => copyInviteMessage(s)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-indigo-50 hover:text-indigo-600 text-slate-700 font-medium"
+                          >
+                            <Copy className="w-3 h-3" />
+                            <span>Copy</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => requestDeleteStudent(s)}
+                            title="Xóa tài khoản học sinh test"
+                            className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
                       </div>
-                      <div className="flex items-center gap-3">
-                        <span className="text-slate-600">
-                          PIN: <strong className="font-mono text-slate-900">{s.pin_code}</strong>
-                        </span>
-                        <button
-                          onClick={() => copyInviteMessage(s)}
-                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-indigo-50 hover:text-indigo-600 text-slate-700 font-medium transition"
-                        >
-                          <Copy className="w-3 h-3" />
-                          <span>Copy gửi HS</span>
-                        </button>
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             </div>
@@ -2501,10 +3684,126 @@ export default function App() {
         </main>
       )}
 
+      {/* MODAL PHÂN TÍCH ĐỀ THI & TOP CÂU SAI NHIỀU NHẤT + DANH SÁCH BÀI NỘP */}
+      {analyticsAssignment && assignmentAnalyticsData && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-white rounded-2xl max-w-4xl w-full p-6 shadow-2xl border border-slate-200 max-h-[90vh] overflow-y-auto space-y-5">
+            <div className="flex items-start justify-between border-b border-slate-200 pb-4">
+              <div>
+                <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
+                  <BarChart3 className="w-5 h-5 text-indigo-600" />
+                  <span>Phân tích đề: {analyticsAssignment.title}</span>
+                </h2>
+                <p className="text-xs text-slate-500 mt-1">
+                  Tổng số lượt nộp: <strong>{assignmentAnalyticsData.asgSubs.length}</strong> • Điểm trung bình:{' '}
+                  <strong className="text-indigo-600">{assignmentAnalyticsData.avgScore}/10</strong>
+                </p>
+              </div>
+              <button
+                onClick={() => setAnalyticsAssignment(null)}
+                className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-100"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* TOP CÂU SAI NHIỀU NHẤT */}
+            <div className="space-y-2.5">
+              <h3 className="text-sm font-bold text-rose-700 flex items-center gap-1.5">
+                <AlertTriangle className="w-4 h-4" />
+                <span>Top những câu hỏi nhiều học sinh sai nhất (Ưu tiên chữa trên lớp)</span>
+              </h3>
+              {assignmentAnalyticsData.topMissed.length === 0 ? (
+                <div className="p-4 rounded-xl bg-slate-50 text-xs text-slate-500">
+                  Chưa có dữ liệu câu sai trên đề này.
+                </div>
+              ) : (
+                <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                  {assignmentAnalyticsData.topMissed.map((q) => (
+                    <div
+                      key={q.number}
+                      className="p-3 rounded-xl bg-rose-50/60 border border-rose-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs"
+                    >
+                      <div className="space-y-0.5 flex-1">
+                        <div className="font-bold text-slate-900">
+                          Câu {q.number}: {q.text}
+                        </div>
+                        <div className="text-slate-600">
+                          Đáp án đúng: <strong className="text-emerald-700">{q.correctAnswer || 'GV chấm'}</strong>
+                          {q.mostCommonWrong && (
+                            <span className="ml-3 text-rose-700">
+                              • Lỗi phổ biến nhất: Chọn <strong>"{q.mostCommonWrong[0]}"</strong> ({q.mostCommonWrong[1]} em)
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      <span className="px-2.5 py-1 rounded-lg bg-rose-600 text-white font-bold shrink-0">
+                        Sai {q.wrongCount}/{q.attempts} ({q.wrongRate}%)
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* DANH SÁCH TẤT CẢ BÀI NỘP CỦA ĐỀ NÀY (XEM / SỬA ĐIỂM / XÓA) */}
+            <div className="space-y-2.5">
+              <h3 className="text-sm font-bold text-slate-900">
+                Danh sách học sinh đã nộp đề này ({assignmentAnalyticsData.asgSubs.length})
+              </h3>
+              <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden">
+                {assignmentAnalyticsData.asgSubs.length === 0 ? (
+                  <div className="p-4 text-xs text-slate-400">Chưa có học sinh nào nộp bài này.</div>
+                ) : (
+                  assignmentAnalyticsData.asgSubs.map((sub) => {
+                    const stu = students.find((s) => s.id === sub.student_id);
+                    return (
+                      <div
+                        key={sub.id}
+                        className="p-3 bg-white flex items-center justify-between gap-3 text-xs"
+                      >
+                        <div>
+                          <span className="font-bold text-slate-900">
+                            {stu?.full_name || sub.student_code}
+                          </span>
+                          <span className="text-slate-400 ml-2">({sub.student_code})</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-indigo-600">
+                            {sub.score !== null ? `${sub.score}/10đ` : 'Chờ chấm'}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setAnalyticsAssignment(null);
+                              openManualReviewModal(sub);
+                            }}
+                            className="px-2.5 py-1 rounded-lg bg-indigo-50 text-indigo-700 hover:bg-indigo-100 font-semibold"
+                          >
+                            Xem & Sửa điểm
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => requestDeleteSubmission(sub, stu?.full_name)}
+                            className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* MODAL DEEP-DIVE HỌC SINH */}
       {deepDiveStudent && deepDiveData && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
-          <div className="bg-white rounded-2xl max-w-3xl w-full p-6 shadow-2xl border border-slate-200 max-h-[90vh] overflow-y-auto space-y-6">
+          <div className="bg-white rounded-2xl max-w-3xl w-full p-6 shadow-2xl border border-slate-200 max-h-[90vh] overflow-y-auto space-y-5">
             <div className="flex items-start justify-between border-b border-slate-200 pb-4">
               <div>
                 <div className="flex items-center gap-2">
@@ -2523,11 +3822,76 @@ export default function App() {
               </button>
             </div>
 
+            {/* NHẬN XÉT TỰ ĐỘNG GỬI RIÊNG PHỤ HUYNH */}
+            <div className="p-4 rounded-xl bg-emerald-50/80 border border-emerald-200 space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-emerald-900">
+                  Nhận xét chi tiết tự động (Gửi Phụ huynh em {deepDiveStudent.full_name})
+                </h3>
+                <button
+                  type="button"
+                  onClick={() => {
+                    navigator.clipboard.writeText(deepDiveData.parentMessage);
+                    notify(`Đã copy báo cáo của ${deepDiveStudent.full_name} để dán gửi Phụ huynh!`);
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold shadow-sm"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                  <span>Copy gửi Phụ huynh</span>
+                </button>
+              </div>
+              <pre className="whitespace-pre-wrap font-sans text-xs text-slate-800 bg-white p-3 rounded-xl border border-emerald-200 leading-relaxed">
+                {deepDiveData.parentMessage}
+              </pre>
+            </div>
+
             <div>
               <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500 mb-2">
                 Biểu đồ phong độ cá nhân
               </h3>
               <TrendLineChart points={deepDiveData.trend} color="#4f46e5" />
+            </div>
+
+            {/* LỊCH SỬ BÀI ĐÃ NỘP (CÓ NÚT XEM/SỬA ĐIỂM & XÓA) */}
+            <div className="space-y-2">
+              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500">
+                Lịch sử bài đã nộp ({deepDiveData.submissions.length})
+              </h3>
+              {deepDiveData.submissions.map((sub) => {
+                const asg = assignments.find((a) => a.id === sub.assignment_id);
+                return (
+                  <div
+                    key={sub.id}
+                    className="p-3 rounded-xl bg-slate-50 border border-slate-200 flex items-center justify-between gap-3 text-xs"
+                  >
+                    <div>
+                      <div className="font-bold text-slate-900">{asg?.title || 'Bài tập'}</div>
+                      <div className="text-slate-500 mt-0.5">
+                        Điểm: <strong className="text-indigo-600">{sub.score ?? 'Chờ chấm'}</strong>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDeepDiveStudent(null);
+                          openManualReviewModal(sub);
+                        }}
+                        className="px-2.5 py-1.5 rounded-lg bg-indigo-600 text-white font-semibold"
+                      >
+                        Xem & Sửa điểm
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => requestDeleteSubmission(sub, deepDiveStudent.full_name)}
+                        className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
 
             <div className="grid md:grid-cols-2 gap-4">
@@ -2592,7 +3956,7 @@ export default function App() {
         </div>
       )}
 
-      {/* MODAL GIÁO VIÊN CHẤM BÀI (CÓ NÚT TICK ĐÚNG / SAI TỪNG CÂU + TỰ TÍNH ĐIỂM TỔNG) */}
+      {/* MODAL GIÁO VIÊN CHẤM BÀI & SỬA ĐIỂM */}
       {reviewingSubmission && (() => {
         const targetAsg = assignments.find((a) => a.id === reviewingSubmission.assignment_id);
         const asgQuestions = getAssignmentQuestions(targetAsg);
@@ -2616,17 +3980,27 @@ export default function App() {
               <div className="flex items-center justify-between border-b border-slate-100 pb-3">
                 <div>
                   <h3 className="font-bold text-slate-900">
-                    Chấm bài nộp của {reviewingSubmission.student_code}
+                    Chấm bài & Sửa điểm: {reviewingSubmission.student_code}
                   </h3>
                   <p className="text-xs text-slate-500">{targetAsg?.title}</p>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setReviewingSubmission(null)}
-                  className="text-slate-400 hover:text-slate-600"
-                >
-                  <X className="w-5 h-5" />
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => requestDeleteSubmission(reviewingSubmission)}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 text-xs font-semibold"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Xóa lượt nộp</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setReviewingSubmission(null)}
+                    className="text-slate-400 hover:text-slate-600"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
               </div>
 
               {reviewingSubmission.file_url && (
@@ -2698,7 +4072,6 @@ export default function App() {
                               </div>
                             </div>
 
-                            {/* NÚT TICK ĐÚNG / SAI */}
                             <div className="flex items-center gap-1.5 shrink-0">
                               <button
                                 type="button"
@@ -2735,7 +4108,7 @@ export default function App() {
                             <div className="pt-1">
                               <input
                                 type="text"
-                                placeholder="Ghi chú đáp án đúng cho học sinh xem (VD: B hoặc giải thích ngắn)..."
+                                placeholder="Ghi chú đáp án đúng & giải thích cho học sinh xem..."
                                 value={gradeQuestionNotes[qKey] || ''}
                                 onChange={(e) =>
                                   setGradeQuestionNotes((prev) => ({
@@ -2764,7 +4137,7 @@ export default function App() {
               <div className="grid sm:grid-cols-2 gap-3 pt-1">
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Điểm tổng (0 - 10) * <span className="text-[11px] font-normal text-slate-400">(Tự tính khi tick hoặc nhập tay)</span>
+                    Điểm tổng (0 - 10) *
                   </label>
                   <input
                     type="number"
@@ -2857,16 +4230,52 @@ export default function App() {
             </div>
           </div>
 
+          {/* CẢNH BÁO HẠN NỘP SẮP ĐẾN / QUÁ HẠN */}
+          {studentPortalData.urgentTasks.length > 0 && (
+            <div className="bg-rose-50 border border-rose-200 rounded-2xl p-4 space-y-1.5">
+              <div className="flex items-center gap-1.5 text-xs font-bold text-rose-900">
+                <Clock className="w-4 h-4 text-rose-600" />
+                <span>Cảnh báo hạn nộp bài tập ({studentPortalData.urgentTasks.length} bài cần hoàn thành gấp)</span>
+              </div>
+              {studentPortalData.urgentTasks.map((t) => {
+                const info = getDeadlineBadgeInfo(t.due_date);
+                return (
+                  <div key={t.id} className="text-xs text-rose-800 flex items-center justify-between">
+                    <span>• <strong>{t.title}</strong> — {info?.label}</span>
+                    <button
+                      type="button"
+                      onClick={() => handleOpenStudentAssignment(t)}
+                      className="text-rose-700 font-bold underline hover:text-rose-900"
+                    >
+                      Làm ngay →
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* THÔNG BÁO NHẮC NHỞ TỪ GIÁO VIÊN */}
           {studentPortalData.myAnnouncements.length > 0 && (
-            <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 space-y-1.5">
+            <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 space-y-2">
               <div className="flex items-center gap-1.5 text-xs font-bold text-amber-900">
                 <Bell className="w-4 h-4 text-amber-600" />
-                <span>Thông báo từ giáo viên</span>
+                <span>Nhắc nhở từ giáo viên ({studentPortalData.myAnnouncements.length})</span>
               </div>
-              {studentPortalData.myAnnouncements.slice(0, 3).map((ann) => (
-                <p key={ann.id} className="text-xs text-amber-800">
-                  • {ann.message}
-                </p>
+              {studentPortalData.myAnnouncements.slice(0, 4).map((ann) => (
+                <div
+                  key={ann.id}
+                  className="flex items-center justify-between gap-3 bg-white/80 px-3 py-2 rounded-xl text-xs text-amber-900"
+                >
+                  <span>• {ann.message}</span>
+                  <button
+                    type="button"
+                    onClick={() => handleDismissAnnouncement(ann.id)}
+                    className="px-2 py-0.5 rounded bg-amber-100 hover:bg-amber-200 text-amber-900 font-semibold shrink-0"
+                  >
+                    Đã hiểu
+                  </button>
+                </div>
               ))}
             </div>
           )}
@@ -2882,15 +4291,25 @@ export default function App() {
                   <div className="grid sm:grid-cols-2 gap-4">
                     {studentPortalData.remedialTasks.map((task) => {
                       const sub = studentPortalData.subByAsg[task.id];
+                      const deadlineInfo = !sub ? getDeadlineBadgeInfo(task.due_date) : null;
                       return (
                         <div
                           key={task.id}
                           className="bg-white p-4 rounded-2xl border-2 border-rose-200 shadow-sm flex flex-col justify-between gap-3"
                         >
                           <div>
-                            <span className="px-2 py-0.5 rounded-md bg-rose-50 text-rose-700 text-[11px] font-bold">
-                              Ôn phần yếu: {task.topic}
-                            </span>
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="px-2 py-0.5 rounded-md bg-rose-50 text-rose-700 text-[11px] font-bold">
+                                Ôn phần yếu: {task.topic}
+                              </span>
+                              {deadlineInfo && (
+                                <span
+                                  className={`px-2 py-0.5 rounded-md border text-[11px] font-bold ${deadlineInfo.badgeClass}`}
+                                >
+                                  {deadlineInfo.label}
+                                </span>
+                              )}
+                            </div>
                             <h3 className="font-bold text-slate-900 mt-1.5">{task.title}</h3>
                           </div>
                           <div className="flex items-center justify-between pt-2 border-t border-slate-100">
@@ -2899,18 +4318,17 @@ export default function App() {
                                 {sub.score !== null ? `Đã chấm: ${sub.score}/10` : 'Đã nộp (Chờ chấm)'}
                               </span>
                             ) : (
-                              <span className="text-xs text-rose-600 font-medium">Cần hoàn thành</span>
+                              <span className="text-xs text-rose-600 font-medium">Chưa nộp</span>
                             )}
                             <button
-                              onClick={() => {
-                                setSubmittingAsg(task);
-                                setStuInteractiveAnswers({});
-                                setStuAnswerInput('');
-                                setStuPdfFile(null);
-                              }}
-                              className="px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold"
+                              onClick={() => handleOpenStudentAssignment(task)}
+                              className={`px-3 py-1.5 rounded-xl text-white text-xs font-semibold ${
+                                sub
+                                  ? 'bg-emerald-600 hover:bg-emerald-700'
+                                  : 'bg-rose-600 hover:bg-rose-700'
+                              }`}
                             >
-                              {sub ? 'Làm lại' : 'Làm bài ngay'}
+                              {sub ? 'Xem bài & Đáp án' : 'Làm bài ngay'}
                             </button>
                           </div>
                         </div>
@@ -2926,46 +4344,71 @@ export default function App() {
                   {studentPortalData.classTasks.map((task) => {
                     const sub = studentPortalData.subByAsg[task.id];
                     const qList = getAssignmentQuestions(task);
+                    const meta = getAssignmentMeta(task);
+                    const deadlineInfo = !sub ? getDeadlineBadgeInfo(task.due_date) : null;
+                    const hasDraft =
+                      !sub &&
+                      Boolean(
+                        localStorage.getItem(`sc_draft_${currentStudent.student_code}_${task.id}`)
+                      );
+
                     return (
                       <div
                         key={task.id}
                         className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm flex flex-col justify-between gap-3"
                       >
                         <div>
-                          <div className="flex items-center justify-between text-xs">
-                            <span className="px-2 py-0.5 rounded-md bg-indigo-50 text-indigo-700 font-bold">
-                              Tuần {task.week_number}
-                            </span>
-                            <span className="text-slate-400">Hạn: {task.due_date || 'Mở'}</span>
+                          <div className="flex flex-wrap items-center justify-between gap-1.5 text-xs">
+                            <div className="flex items-center gap-1.5">
+                              <span className="px-2 py-0.5 rounded-md bg-indigo-50 text-indigo-700 font-bold">
+                                Tuần {task.week_number}
+                              </span>
+                              {meta.timeLimitMinutes > 0 && (
+                                <span className="px-2 py-0.5 rounded-md bg-amber-50 text-amber-800 font-bold">
+                                  ⏱ {meta.timeLimitMinutes} phút
+                                </span>
+                              )}
+                            </div>
+                            {deadlineInfo && (
+                              <span
+                                className={`px-2 py-0.5 rounded-md border text-[11px] font-bold ${deadlineInfo.badgeClass}`}
+                              >
+                                {deadlineInfo.label}
+                              </span>
+                            )}
                           </div>
                           <h3 className="font-bold text-slate-900 mt-2">{task.title}</h3>
                           <p className="text-xs text-slate-500 mt-0.5">
                             Chuyên đề: {task.topic || 'Tổng hợp'}
                             {qList.length > 0 && ` • ${qList.length} câu hỏi trực tuyến`}
                           </p>
+                          {hasDraft && (
+                            <div className="mt-1.5 text-[11px] font-semibold text-indigo-600">
+                              💾 Đang lưu dở bài làm (Bấm vào để làm tiếp)
+                            </div>
+                          )}
                         </div>
 
                         <div className="flex items-center justify-between pt-2 border-t border-slate-100">
                           {sub ? (
                             <span className="text-xs font-bold text-emerald-600">
                               {sub.score !== null
-                                ? `Điểm: ${sub.score}/10`
+                                ? `Điểm: ${sub.score}/10 (Đã khóa nộp)`
                                 : 'Đã nộp (Chờ giáo viên chấm)'}
                             </span>
                           ) : (
-                            <span className="text-xs text-amber-600 font-medium">Chưa làm</span>
+                            <span className="text-xs text-amber-600 font-medium">Chưa nộp bài</span>
                           )}
                           <button
-                            onClick={() => {
-                              setSubmittingAsg(task);
-                              setStuInteractiveAnswers({});
-                              setStuAnswerInput('');
-                              setStuPdfFile(null);
-                            }}
-                            className="px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold flex items-center gap-1.5"
+                            onClick={() => handleOpenStudentAssignment(task)}
+                            className={`px-3.5 py-1.5 rounded-xl text-white text-xs font-semibold flex items-center gap-1.5 ${
+                              sub
+                                ? 'bg-emerald-600 hover:bg-emerald-700'
+                                : 'bg-indigo-600 hover:bg-indigo-700'
+                            }`}
                           >
                             <BookOpen className="w-3.5 h-3.5" />
-                            <span>{sub ? 'Xem / Làm lại' : 'Làm bài ngay'}</span>
+                            <span>{sub ? 'Xem lại bài & Đáp án' : hasDraft ? 'Làm tiếp bài' : 'Làm bài ngay'}</span>
                           </button>
                         </div>
                       </div>
@@ -2983,7 +4426,7 @@ export default function App() {
               </div>
 
               <div className="space-y-3">
-                <h2 className="font-bold text-slate-900 text-sm">Chi tiết điểm & từng câu Đúng / Sai</h2>
+                <h2 className="font-bold text-slate-900 text-sm">Chi tiết điểm, câu Đúng / Sai & Giải thích</h2>
                 {studentPortalData.mySubs.map((sub) => {
                   const asg = assignments.find((a) => a.id === sub.assignment_id);
                   const fb = sub.ai_feedback_json || {};
@@ -2991,16 +4434,30 @@ export default function App() {
 
                   return (
                     <div key={sub.id} className="bg-white p-4 rounded-2xl border border-slate-200 space-y-3">
-                      <div className="flex items-center justify-between">
+                      <div className="flex items-center justify-between gap-2">
                         <div className="font-bold text-sm text-slate-900">{asg?.title || 'Bài tập'}</div>
-                        <span className="px-2.5 py-0.5 rounded-full bg-indigo-50 text-indigo-700 font-bold text-xs">
-                          {sub.score !== null ? `${sub.score}/10 điểm` : 'Chờ giáo viên chấm'}
-                        </span>
+                        <div className="flex items-center gap-2">
+                          <span className="px-2.5 py-0.5 rounded-full bg-indigo-50 text-indigo-700 font-bold text-xs">
+                            {sub.score !== null ? `${sub.score}/10 điểm` : 'Chờ giáo viên chấm'}
+                          </span>
+                          {asg && (
+                            <button
+                              type="button"
+                              onClick={() => handleOpenStudentAssignment(asg)}
+                              className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-indigo-50 text-indigo-700 text-xs font-semibold"
+                            >
+                              Mở đề & Giải thích
+                            </button>
+                          )}
+                        </div>
                       </div>
 
-                      {fb.summary && <p className="text-xs text-slate-700">{fb.summary}</p>}
+                      {fb.summary && (
+                        <p className="text-xs text-slate-700 bg-slate-50 p-3 rounded-xl border border-slate-100">
+                          {fb.summary}
+                        </p>
+                      )}
 
-                      {/* HIỂN THỊ TỪNG CÂU ĐÚNG / SAI CHO HỌC SINH */}
                       {breakdown.length > 0 && (
                         <div className="space-y-1.5">
                           <div className="text-[11px] font-bold text-slate-600">
@@ -3036,10 +4493,10 @@ export default function App() {
                       )}
 
                       {Array.isArray(fb.wrongDetails) && fb.wrongDetails.length > 0 && (
-                        <div className="p-3 rounded-xl bg-rose-50 text-xs text-rose-800 space-y-1">
-                          <div className="font-bold">Chi tiết các câu sai cần xem lại:</div>
+                        <div className="p-3 rounded-xl bg-rose-50 text-xs text-rose-800 space-y-1.5">
+                          <div className="font-bold">Chi tiết các câu sai & Giải thích:</div>
                           {fb.wrongDetails.map((line, i) => (
-                            <div key={i}>• {line}</div>
+                            <div key={i} className="leading-relaxed">• {line}</div>
                           ))}
                         </div>
                       )}
@@ -3052,10 +4509,17 @@ export default function App() {
         </main>
       )}
 
-      {/* MODAL HỌC SINH LÀM BÀI TRỰC TIẾP TRÊN WEB */}
+      {/* MODAL HỌC SINH LÀM BÀI (KHÓA NỘP 1 LẦN + AUTO-SAVE + TIMER + ĐỌC HIỂU + XEM ĐÁP ÁN & GIẢI THÍCH) */}
       {submittingAsg && (() => {
         const qList = getAssignmentQuestions(submittingAsg);
         const cleanRubric = getCleanRubricText(submittingAsg);
+        const existingSub = studentPortalData?.subByAsg?.[submittingAsg.id];
+        const isLockedReview = Boolean(existingSub);
+        const breakdownMap = {};
+        (existingSub?.ai_feedback_json?.breakdown || []).forEach((b) => {
+          breakdownMap[String(b.question)] = b;
+        });
+
         const answeredCount = qList.filter(
           (q) => Boolean(stuInteractiveAnswers[String(q.number)]?.trim())
         ).length;
@@ -3063,19 +4527,26 @@ export default function App() {
         return (
           <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4 overflow-y-auto">
             <form
-              onSubmit={handleStudentSubmit}
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (!isLockedReview) submitStudentWork(false);
+              }}
               className="bg-white rounded-2xl max-w-3xl w-full p-5 sm:p-6 shadow-2xl border border-slate-200 max-h-[92vh] flex flex-col gap-4"
             >
-              <div className="flex items-start justify-between border-b border-slate-100 pb-3 shrink-0">
+              <div className="flex items-start justify-between border-b border-slate-100 pb-3 shrink-0 gap-2">
                 <div>
                   <h3 className="font-bold text-base sm:text-lg text-slate-900">
                     {submittingAsg.title}
                   </h3>
-                  <div className="flex flex-wrap items-center gap-3 text-xs text-slate-500 mt-1">
+                  <div className="flex flex-wrap items-center gap-2.5 text-xs text-slate-500 mt-1">
                     <span>Chuyên đề: {submittingAsg.topic || 'Tổng hợp'}</span>
                     {qList.length > 0 && (
                       <span className="font-bold text-indigo-600">
-                        Tiến độ: {answeredCount}/{qList.length} câu
+                        {isLockedReview
+                          ? `Điểm đạt được: ${
+                              existingSub.score !== null ? `${existingSub.score}/10` : 'Chờ GV chấm'
+                            }`
+                          : `Đã chọn: ${answeredCount}/${qList.length} câu`}
                       </span>
                     )}
                     {(submittingAsg.source_file_url || submittingAsg.answer_key_url) && (
@@ -3085,20 +4556,55 @@ export default function App() {
                         rel="noreferrer"
                         className="inline-flex items-center gap-1 text-indigo-600 font-semibold hover:underline"
                       >
-                        <span>Mở file đề gốc</span>
+                        <span>File đề gốc</span>
                         <ExternalLink className="w-3 h-3" />
                       </a>
                     )}
                   </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setSubmittingAsg(null)}
-                  className="text-slate-400 hover:text-slate-600 p-1"
-                >
-                  <X className="w-5 h-5" />
-                </button>
+
+                <div className="flex items-center gap-2 shrink-0">
+                  {!isLockedReview && remainingSeconds !== null && (
+                    <div
+                      className={`px-3 py-1.5 rounded-xl font-mono text-xs font-bold flex items-center gap-1.5 border ${
+                        remainingSeconds <= 60
+                          ? 'bg-rose-600 text-white border-rose-600 animate-pulse'
+                          : 'bg-amber-50 text-amber-800 border-amber-300'
+                      }`}
+                    >
+                      <Timer className="w-3.5 h-3.5" />
+                      <span>{formatSecondsMMSS(remainingSeconds)}</span>
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSubmittingAsg(null);
+                      setRemainingSeconds(null);
+                    }}
+                    className="text-slate-400 hover:text-slate-600 p-1"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
               </div>
+
+              {isLockedReview ? (
+                <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-900 space-y-1 shrink-0">
+                  <div className="font-bold">
+                    🔒 Bài làm đã nộp & khóa chỉnh sửa (Mỗi bài chỉ nộp 1 lần).
+                  </div>
+                  {existingSub.ai_feedback_json?.summary && (
+                    <div>{existingSub.ai_feedback_json.summary}</div>
+                  )}
+                </div>
+              ) : (
+                draftRestoredBanner && (
+                  <div className="px-3.5 py-2 rounded-xl bg-indigo-50 border border-indigo-200 text-xs text-indigo-800 font-medium shrink-0">
+                    💾 Đã tự động khôi phục các câu em đã chọn trước đó!
+                  </div>
+                )
+              )}
 
               <div className="overflow-y-auto space-y-4 pr-1 flex-1">
                 {cleanRubric && (
@@ -3109,90 +4615,146 @@ export default function App() {
 
                 {qList.length > 0 ? (
                   <div className="space-y-4">
-                    {qList.map((q) => {
+                    {qList.map((q, idx) => {
                       const qKey = String(q.number);
                       const chosen = stuInteractiveAnswers[qKey] || '';
+                      const bItem = breakdownMap[qKey];
+                      const prevPassage = idx > 0 ? qList[idx - 1].passage : '';
+                      const showPassageBox = q.passage && q.passage !== prevPassage;
 
                       return (
-                        <div
-                          key={q.id || qKey}
-                          className="p-4 rounded-2xl bg-slate-50/70 border border-slate-200 space-y-3"
-                        >
-                          <div className="text-sm font-semibold text-slate-900 whitespace-pre-line">
-                            <span className="inline-block px-2 py-0.5 rounded-md bg-indigo-600 text-white text-xs font-bold mr-2">
-                              Câu {q.number}
-                            </span>
-                            {q.text}
-                          </div>
-
-                          {q.type === 'mcq' && (
-                            <div className="grid sm:grid-cols-2 gap-2">
-                              {['A', 'B', 'C', 'D']
-                                .filter((opt) => q.options?.[opt])
-                                .map((opt) => {
-                                  const active = chosen === opt;
-                                  return (
-                                    <button
-                                      key={opt}
-                                      type="button"
-                                      onClick={() =>
-                                        setStuInteractiveAnswers((prev) => ({
-                                          ...prev,
-                                          [qKey]: opt
-                                        }))
-                                      }
-                                      className={`text-left p-2.5 rounded-xl border text-xs flex items-start gap-2.5 transition ${
-                                        active
-                                          ? 'bg-indigo-600 text-white border-indigo-600 shadow-sm'
-                                          : 'bg-white text-slate-800 border-slate-200 hover:border-indigo-400'
-                                      }`}
-                                    >
-                                      <span
-                                        className={`w-5 h-5 rounded-md font-bold flex items-center justify-center shrink-0 ${
-                                          active
-                                            ? 'bg-white text-indigo-600'
-                                            : 'bg-slate-100 text-slate-700'
-                                        }`}
-                                      >
-                                        {opt}
-                                      </span>
-                                      <span className="pt-0.5">{q.options[opt]}</span>
-                                    </button>
-                                  );
-                                })}
+                        <React.Fragment key={q.id || qKey}>
+                          {/* KHUNG ĐOẠN VĂN ĐỌC HIỂU CHUNG */}
+                          {showPassageBox && (
+                            <div className="p-4 rounded-2xl bg-indigo-50/70 border border-indigo-200 space-y-1.5">
+                              <div className="text-xs font-bold text-indigo-900 flex items-center gap-1.5">
+                                <BookOpen className="w-4 h-4 text-indigo-600" />
+                                <span>Đoạn văn đọc hiểu / Bài đọc chung</span>
+                              </div>
+                              <div className="text-xs sm:text-sm text-slate-800 whitespace-pre-line leading-relaxed bg-white p-3.5 rounded-xl border border-indigo-100">
+                                {q.passage}
+                              </div>
                             </div>
                           )}
 
-                          {q.type === 'short' && (
-                            <input
-                              type="text"
-                              placeholder="Nhập đáp án ngắn của em..."
-                              value={chosen}
-                              onChange={(e) =>
-                                setStuInteractiveAnswers((prev) => ({
-                                  ...prev,
-                                  [qKey]: e.target.value
-                                }))
-                              }
-                              className="w-full px-3.5 py-2 text-sm bg-white border border-slate-300 rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none"
-                            />
-                          )}
+                          <div
+                            className={`p-4 rounded-2xl border space-y-3 ${
+                              isLockedReview && bItem?.status === 'correct'
+                                ? 'bg-emerald-50/50 border-emerald-300'
+                                : isLockedReview && bItem?.status === 'wrong'
+                                ? 'bg-rose-50/50 border-rose-300'
+                                : 'bg-slate-50/70 border-slate-200'
+                            }`}
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="text-sm font-semibold text-slate-900 whitespace-pre-line">
+                                <span className="inline-block px-2 py-0.5 rounded-md bg-indigo-600 text-white text-xs font-bold mr-2">
+                                  Câu {q.number}
+                                </span>
+                                {q.text}
+                              </div>
 
-                          {q.type === 'essay' && (
-                            <textarea
-                              rows={3}
-                              placeholder="Nhập lời giải tự luận của em vào đây (hoặc đính kèm file PDF bài viết tay ở cuối trang)..."
-                              value={chosen}
-                              onChange={(e) =>
-                                setStuInteractiveAnswers((prev) => ({
-                                  ...prev,
-                                  [qKey]: e.target.value
-                                }))
-                              }
-                              className="w-full px-3.5 py-2 text-sm bg-white border border-slate-300 rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none"
-                            />
-                          )}
-                        </div>
+                              {isLockedReview && bItem && (
+                                <span
+                                  className={`px-2 py-0.5 rounded-md text-[11px] font-bold shrink-0 ${
+                                    bItem.status === 'correct'
+                                      ? 'bg-emerald-600 text-white'
+                                      : 'bg-rose-600 text-white'
+                                  }`}
+                                >
+                                  {bItem.status === 'correct' ? '✓ Đúng' : '✗ Sai'}
+                                </span>
+                              )}
+                            </div>
+
+                            {q.type === 'mcq' ? (
+                              <div className="grid sm:grid-cols-2 gap-2">
+                                {['A', 'B', 'C', 'D']
+                                  .filter((opt) => q.options?.[opt])
+                                  .map((opt) => {
+                                    const active = chosen.toUpperCase() === opt;
+                                    const isCorrectOpt =
+                                      isLockedReview &&
+                                      String(q.correctAnswer || bItem?.expected || '')
+                                        .trim()
+                                        .toUpperCase() === opt;
+
+                                    let btnStyle =
+                                      'bg-white text-slate-800 border-slate-200 hover:border-indigo-400';
+                                    if (isLockedReview) {
+                                      if (isCorrectOpt) {
+                                        btnStyle =
+                                          'bg-emerald-600 text-white border-emerald-600 shadow-sm';
+                                      } else if (active && !isCorrectOpt) {
+                                        btnStyle = 'bg-rose-600 text-white border-rose-600';
+                                      } else {
+                                        btnStyle = 'bg-white text-slate-500 border-slate-200 opacity-80';
+                                      }
+                                    } else if (active) {
+                                      btnStyle =
+                                        'bg-indigo-600 text-white border-indigo-600 shadow-sm';
+                                    }
+
+                                    return (
+                                      <button
+                                        key={opt}
+                                        type="button"
+                                        disabled={isLockedReview}
+                                        onClick={() =>
+                                          setStuInteractiveAnswers((prev) => ({
+                                            ...prev,
+                                            [qKey]: opt
+                                          }))
+                                        }
+                                        className={`text-left p-2.5 rounded-xl border text-xs flex items-start gap-2.5 transition ${btnStyle}`}
+                                      >
+                                        <span
+                                          className={`w-5 h-5 rounded-md font-bold flex items-center justify-center shrink-0 ${
+                                            active || isCorrectOpt
+                                              ? 'bg-white text-slate-900'
+                                              : 'bg-slate-100 text-slate-700'
+                                          }`}
+                                        >
+                                          {opt}
+                                        </span>
+                                        <span className="pt-0.5">{q.options[opt]}</span>
+                                      </button>
+                                    );
+                                  })}
+                              </div>
+                            ) : (
+                              <input
+                                type="text"
+                                disabled={isLockedReview}
+                                placeholder="Nhập câu trả lời / đáp án của em..."
+                                value={chosen}
+                                onChange={(e) =>
+                                  setStuInteractiveAnswers((prev) => ({
+                                    ...prev,
+                                    [qKey]: e.target.value
+                                  }))
+                                }
+                                className="w-full px-3.5 py-2 text-sm bg-white border border-slate-300 rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none disabled:bg-slate-100"
+                              />
+                            )}
+
+                            {/* HIỆN ĐÁP ÁN ĐÚNG & GIẢI THÍCH NGAY SAU KHI NỘP */}
+                            {isLockedReview && (q.correctAnswer || bItem?.expected || q.explanation || bItem?.explanation) && (
+                              <div className="p-2.5 rounded-xl bg-white border border-slate-200 text-xs space-y-1">
+                                {(q.correctAnswer || bItem?.expected) && (
+                                  <div className="text-emerald-700 font-bold">
+                                    ✓ Đáp án chuẩn: {q.correctAnswer || bItem?.expected}
+                                  </div>
+                                )}
+                                {(q.explanation || bItem?.explanation) && (
+                                  <div className="text-slate-700">
+                                    💡 <strong>Giải thích:</strong> {q.explanation || bItem?.explanation}
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        </React.Fragment>
                       );
                     })}
                   </div>
@@ -3204,6 +4766,7 @@ export default function App() {
                       </label>
                       <input
                         type="text"
+                        disabled={isLockedReview}
                         placeholder="1:A, 2:B, 3:C..."
                         value={stuAnswerInput}
                         onChange={(e) => setStuAnswerInput(e.target.value)}
@@ -3213,37 +4776,55 @@ export default function App() {
                   )
                 )}
 
-                {/* Tùy chọn đính kèm thêm file PDF viết tay */}
-                <div className="pt-2">
-                  <label className="flex items-center justify-between p-3 border border-dashed border-slate-300 rounded-xl bg-slate-50 hover:bg-slate-100 cursor-pointer transition">
-                    <div className="flex items-center gap-2 text-xs text-slate-700">
-                      <Upload className="w-4 h-4 text-indigo-600" />
-                      <span>
-                        {stuPdfFile
-                          ? `File đính kèm: ${stuPdfFile.name}`
-                          : 'Đính kèm thêm file PDF bài giải viết tay (Không bắt buộc)'}
-                      </span>
-                    </div>
-                    <span className="text-[11px] font-semibold text-indigo-600">Chọn file</span>
-                    <input
-                      type="file"
-                      accept=".pdf,application/pdf"
-                      onChange={(e) => setStuPdfFile(e.target.files?.[0] || null)}
-                      className="hidden"
-                    />
-                  </label>
-                </div>
+                {!isLockedReview && (
+                  <div className="pt-2">
+                    <label className="flex items-center justify-between p-3 border border-dashed border-slate-300 rounded-xl bg-slate-50 hover:bg-slate-100 cursor-pointer transition">
+                      <div className="flex items-center gap-2 text-xs text-slate-700">
+                        <Upload className="w-4 h-4 text-indigo-600" />
+                        <span>
+                          {stuPdfFile
+                            ? `File đính kèm: ${stuPdfFile.name}`
+                            : 'Đính kèm thêm file PDF bài giải viết tay (Không bắt buộc)'}
+                        </span>
+                      </div>
+                      <span className="text-[11px] font-semibold text-indigo-600">Chọn file</span>
+                      <input
+                        type="file"
+                        accept=".pdf,application/pdf"
+                        onChange={(e) => setStuPdfFile(e.target.files?.[0] || null)}
+                        className="hidden"
+                      />
+                    </label>
+                  </div>
+                )}
               </div>
 
               <div className="pt-2 border-t border-slate-100 shrink-0">
-                <button
-                  type="submit"
-                  disabled={isSubmitting}
-                  className="w-full py-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold text-sm flex items-center justify-center gap-2 shadow-sm"
-                >
-                  <Send className="w-4 h-4" />
-                  <span>{isSubmitting ? 'Đang nộp bài...' : 'Hoàn thành & Nộp bài'}</span>
-                </button>
+                {isLockedReview ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSubmittingAsg(null);
+                      setRemainingSeconds(null);
+                    }}
+                    className="w-full py-2.5 rounded-xl bg-slate-800 hover:bg-slate-900 text-white font-semibold text-sm"
+                  >
+                    Đóng cửa sổ xem bài
+                  </button>
+                ) : (
+                  <button
+                    type="submit"
+                    disabled={isSubmitting}
+                    className="w-full py-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold text-sm flex items-center justify-center gap-2 shadow-sm"
+                  >
+                    <Send className="w-4 h-4" />
+                    <span>
+                      {isSubmitting
+                        ? 'Đang nộp bài & chấm điểm...'
+                        : 'Hoàn thành & Nộp bài (Chấm điểm & Xem đáp án ngay)'}
+                    </span>
+                  </button>
+                )}
               </div>
             </form>
           </div>
