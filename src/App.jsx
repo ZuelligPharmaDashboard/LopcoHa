@@ -195,13 +195,16 @@ function autoGradeLegacyTextAnswers(answerKeyRaw, studentAnswerRaw, topic) {
 
   let correct = 0;
   const wrongDetails = [];
+  const breakdown = [];
   keys.forEach((k) => {
     const expected = keyMap[k];
     const actual = stuMap[k] || '(Bỏ trống)';
     if (actual.replace(/\s+/g, '') === expected.replace(/\s+/g, '')) {
       correct += 1;
+      breakdown.push({ question: k.toUpperCase(), status: 'correct', expected, actual });
     } else {
       wrongDetails.push(`Câu ${k.toUpperCase()}: Em chọn "${actual}" — Đáp án đúng là "${expected}"`);
+      breakdown.push({ question: k.toUpperCase(), status: 'wrong', expected, actual });
     }
   });
 
@@ -213,6 +216,7 @@ function autoGradeLegacyTextAnswers(answerKeyRaw, studentAnswerRaw, topic) {
       correctCount: correct,
       totalCount: keys.length,
       wrongDetails,
+      breakdown,
       summary: `Em làm đúng ${correct}/${keys.length} câu.`
     }
   };
@@ -385,10 +389,12 @@ export default function App() {
   const [remAnswerKey, setRemAnswerKey] = useState('');
   const [remNote, setRemNote] = useState('');
 
-  // Chấm bài thủ công
+  // Chấm bài thủ công kèm tick Đúng/Sai từng câu
   const [gradeScore, setGradeScore] = useState('8.5');
   const [gradeWeakTopic, setGradeWeakTopic] = useState('');
   const [gradeComment, setGradeComment] = useState('');
+  const [gradeQuestionMarks, setGradeQuestionMarks] = useState({});
+  const [gradeQuestionNotes, setGradeQuestionNotes] = useState({});
 
   // Cổng học sinh làm bài trực tiếp
   const [studentTab, setStudentTab] = useState('tasks');
@@ -722,7 +728,6 @@ export default function App() {
               .join(', ')
           : asgAnswerKey.trim();
 
-      // Lưu dự phòng JSON vào rubric để chạy mượt ngay cả trước khi chạy file SQL nâng cấp
       const embeddedRubric =
         cleanQuestions.length > 0
           ? `${asgRubric.trim()}\n__SC_QUESTIONS__:${JSON.stringify(cleanQuestions)}`
@@ -746,7 +751,6 @@ export default function App() {
 
       let { error } = await supabase.from('assignments').insert([fullPayload]);
 
-      // Nếu người dùng chưa chạy supabase_upgrade.sql, tự động fallback về các cột gốc
       if (error && error.message?.includes('column')) {
         const fallbackPayload = {
           title: fullPayload.title,
@@ -825,6 +829,83 @@ export default function App() {
     notify(`Đã gửi thông báo nhắc nhở tới ${student.full_name}`);
   };
 
+  // Mở popup chấm bài thủ công và nạp sẵn trạng thái Đúng/Sai từng câu nếu có
+  const openManualReviewModal = (sub) => {
+    const targetAsg = assignments.find((a) => a.id === sub.assignment_id);
+    const qList = getAssignmentQuestions(targetAsg);
+    const ansMap = sub.answers_json || sub.ai_feedback_json?.studentAnswersMap || {};
+    const existingBreakdown = sub.ai_feedback_json?.breakdown || [];
+
+    const initialMarks = {};
+    const initialNotes = {};
+
+    existingBreakdown.forEach((b) => {
+      if (b.question) {
+        initialMarks[String(b.question)] = b.status;
+        if (b.expected && b.status === 'wrong') {
+          initialNotes[String(b.question)] = b.expected;
+        }
+      }
+    });
+
+    qList.forEach((q) => {
+      const k = String(q.number);
+      if (!initialMarks[k] && q.correctAnswer && String(q.correctAnswer).trim() !== '') {
+        const exp = String(q.correctAnswer).trim().toLowerCase().replace(/\s+/g, '');
+        const act = String(ansMap[k] || '').trim().toLowerCase().replace(/\s+/g, '');
+        initialMarks[k] = act !== '' && act === exp ? 'correct' : 'wrong';
+        if (initialMarks[k] === 'wrong') {
+          initialNotes[k] = String(q.correctAnswer).trim();
+        }
+      }
+    });
+
+    setReviewingSubmission(sub);
+    setGradeQuestionMarks(initialMarks);
+    setGradeQuestionNotes(initialNotes);
+
+    if (sub.score !== null && sub.score !== undefined) {
+      setGradeScore(String(sub.score));
+    } else if (qList.length > 0 && Object.keys(initialMarks).length > 0) {
+      const correctCnt = Object.values(initialMarks).filter((v) => v === 'correct').length;
+      setGradeScore(String(Number(((correctCnt / qList.length) * 10).toFixed(2))));
+    } else {
+      setGradeScore('8.5');
+    }
+
+    setGradeWeakTopic(targetAsg?.topic || '');
+    setGradeComment('');
+  };
+
+  const handleToggleQuestionMark = (qKey, status, totalCount) => {
+    setGradeQuestionMarks((prev) => {
+      const next = { ...prev };
+      if (next[qKey] === status) {
+        delete next[qKey];
+      } else {
+        next[qKey] = status;
+      }
+
+      if (totalCount > 0) {
+        const correctCnt = Object.values(next).filter((v) => v === 'correct').length;
+        const autoScore = Number(((correctCnt / totalCount) * 10).toFixed(2));
+        setGradeScore(String(autoScore));
+      }
+      return next;
+    });
+  };
+
+  const handleMarkAllQuestions = (qList, status) => {
+    const next = {};
+    qList.forEach((q) => {
+      next[String(q.number)] = status;
+    });
+    setGradeQuestionMarks(next);
+    if (qList.length > 0) {
+      setGradeScore(status === 'correct' ? '10' : '0');
+    }
+  };
+
   const handleSaveManualGrade = async (e) => {
     e.preventDefault();
     if (!reviewingSubmission || !supabase) return;
@@ -834,6 +915,55 @@ export default function App() {
       .map((s) => s.trim())
       .filter(Boolean);
 
+    const targetAsg = assignments.find((a) => a.id === reviewingSubmission.assignment_id);
+    const asgQuestions = getAssignmentQuestions(targetAsg);
+    const ansMap =
+      reviewingSubmission.answers_json ||
+      reviewingSubmission.ai_feedback_json?.studentAnswersMap ||
+      {};
+
+    const breakdown = [];
+    const wrongDetails = [];
+    let correctCount = 0;
+
+    asgQuestions.forEach((q) => {
+      const k = String(q.number);
+      const mark = gradeQuestionMarks[k];
+      const stuAns = String(ansMap[k] || '(Bỏ trống)').trim();
+      const noteExpected = String(gradeQuestionNotes[k] || q.correctAnswer || '').trim();
+
+      if (mark === 'correct') {
+        correctCount += 1;
+        breakdown.push({
+          question: k,
+          status: 'correct',
+          expected: noteExpected,
+          actual: stuAns
+        });
+      } else if (mark === 'wrong') {
+        breakdown.push({
+          question: k,
+          status: 'wrong',
+          expected: noteExpected,
+          actual: stuAns
+        });
+        wrongDetails.push(
+          noteExpected
+            ? `Câu ${k}: Em trả lời "${stuAns}" — Đáp án đúng: "${noteExpected}"`
+            : `Câu ${k}: Chưa chính xác (Bài làm của em: "${stuAns}")`
+        );
+      }
+    });
+
+    if (wrongDetails.length === 0 && weakArr.length > 0) {
+      wrongDetails.push(`Cần ôn lại chuyên đề: ${weakArr.join(', ')}`);
+    }
+
+    const autoSummary =
+      breakdown.length > 0
+        ? `Giáo viên đã chấm: Đúng ${correctCount}/${breakdown.length} câu (${scoreNum}/10 điểm).`
+        : 'Giáo viên đã chấm điểm và nhận xét bài làm.';
+
     const { error } = await supabase
       .from('submissions')
       .update({
@@ -842,8 +972,13 @@ export default function App() {
         weak_topics: weakArr,
         ai_feedback_json: {
           ...(reviewingSubmission.ai_feedback_json || {}),
-          summary: gradeComment.trim() || 'Giáo viên đã chấm điểm và nhận xét bài làm.',
-          wrongDetails: weakArr.length ? [`Cần ôn lại chuyên đề: ${weakArr.join(', ')}`] : []
+          correctCount,
+          totalCount: breakdown.length || asgQuestions.length,
+          breakdown,
+          wrongDetails,
+          summary: gradeComment.trim()
+            ? `${gradeComment.trim()} (${autoSummary})`
+            : autoSummary
         }
       })
       .eq('id', reviewingSubmission.id);
@@ -852,7 +987,7 @@ export default function App() {
       notify(error.message, 'error');
     } else {
       setReviewingSubmission(null);
-      notify('Đã lưu điểm — Biểu đồ học sinh đã tự động cập nhật!');
+      notify('Đã lưu điểm & kết quả từng câu — Học sinh xem được ngay!');
       fetchAllData();
     }
   };
@@ -918,7 +1053,7 @@ export default function App() {
         } else {
           finalStatus = 'pending_review';
           finalFeedbackJson = {
-            summary: 'Bài làm tự luận / chưa gắn đáp án sẵn đã gửi tới giáo viên để chấm điểm.',
+            summary: 'Bài làm đã gửi tới giáo viên để chấm điểm từng câu.',
             studentAnswersMap: stuInteractiveAnswers
           };
         }
@@ -1656,12 +1791,7 @@ export default function App() {
                             )}
                           </div>
                           <button
-                            onClick={() => {
-                              setReviewingSubmission(sub);
-                              setGradeScore(sub.score ?? '8.5');
-                              setGradeWeakTopic(asg?.topic || '');
-                              setGradeComment('');
-                            }}
+                            onClick={() => openManualReviewModal(sub)}
                             className="shrink-0 px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-xs font-semibold"
                           >
                             Chấm bài
@@ -2462,7 +2592,7 @@ export default function App() {
         </div>
       )}
 
-      {/* MODAL GIÁO VIÊN CHẤM BÀI (HIỂN THỊ TỪNG CÂU HS LÀM TRÊN WEB + PDF) */}
+      {/* MODAL GIÁO VIÊN CHẤM BÀI (CÓ NÚT TICK ĐÚNG / SAI TỪNG CÂU + TỰ TÍNH ĐIỂM TỔNG) */}
       {reviewingSubmission && (() => {
         const targetAsg = assignments.find((a) => a.id === reviewingSubmission.assignment_id);
         const asgQuestions = getAssignmentQuestions(targetAsg);
@@ -2470,12 +2600,18 @@ export default function App() {
           reviewingSubmission.answers_json ||
           reviewingSubmission.ai_feedback_json?.studentAnswersMap ||
           {};
+        const correctTickedCount = Object.values(gradeQuestionMarks).filter(
+          (v) => v === 'correct'
+        ).length;
+        const wrongTickedCount = Object.values(gradeQuestionMarks).filter(
+          (v) => v === 'wrong'
+        ).length;
 
         return (
           <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
             <form
               onSubmit={handleSaveManualGrade}
-              className="bg-white rounded-2xl max-w-2xl w-full p-6 shadow-xl border border-slate-200 max-h-[90vh] overflow-y-auto space-y-4"
+              className="bg-white rounded-2xl max-w-3xl w-full p-6 shadow-xl border border-slate-200 max-h-[92vh] overflow-y-auto space-y-4"
             >
               <div className="flex items-center justify-between border-b border-slate-100 pb-3">
                 <div>
@@ -2506,26 +2642,115 @@ export default function App() {
               )}
 
               {asgQuestions.length > 0 ? (
-                <div className="space-y-2.5 max-h-72 overflow-y-auto pr-1">
-                  <div className="text-xs font-bold text-slate-700">
-                    Chi tiết bài làm trực tiếp của học sinh:
-                  </div>
-                  {asgQuestions.map((q, idx) => {
-                    const stuVal = ansMap[String(q.number)] || '(Học sinh bỏ trống)';
-                    return (
-                      <div
-                        key={q.id || idx}
-                        className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-xs space-y-1"
+                <div className="space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2 bg-slate-100 p-2.5 rounded-xl">
+                    <div className="text-xs font-bold text-slate-700">
+                      Tick Đúng / Sai từng câu ({correctTickedCount} Đúng • {wrongTickedCount} Sai / {asgQuestions.length} câu):
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => handleMarkAllQuestions(asgQuestions, 'correct')}
+                        className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-semibold"
                       >
-                        <div className="font-bold text-slate-900">
-                          Câu {q.number}: {q.text}
+                        ✓ Tick tất cả Đúng
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setGradeQuestionMarks({});
+                          setGradeQuestionNotes({});
+                        }}
+                        className="px-2.5 py-1 rounded-lg bg-white border border-slate-300 text-slate-600 hover:bg-slate-50 text-[11px] font-semibold"
+                      >
+                        Bỏ tick
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-2.5 max-h-80 overflow-y-auto pr-1">
+                    {asgQuestions.map((q, idx) => {
+                      const qKey = String(q.number);
+                      const stuVal = ansMap[qKey] || '(Học sinh bỏ trống)';
+                      const mark = gradeQuestionMarks[qKey];
+                      const chosenOptionText =
+                        q.type === 'mcq' && q.options?.[stuVal] ? ` (${q.options[stuVal]})` : '';
+
+                      return (
+                        <div
+                          key={q.id || idx}
+                          className={`p-3 rounded-xl border text-xs space-y-2 transition ${
+                            mark === 'correct'
+                              ? 'bg-emerald-50/70 border-emerald-300'
+                              : mark === 'wrong'
+                              ? 'bg-rose-50/70 border-rose-300'
+                              : 'bg-slate-50 border-slate-200'
+                          }`}
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="space-y-1 flex-1">
+                              <div className="font-bold text-slate-900">
+                                Câu {q.number}: {q.text}
+                              </div>
+                              <div className="text-indigo-700 font-semibold">
+                                → Học sinh chọn/trả lời: <span className="underline">{stuVal}</span>
+                                <span className="font-normal text-slate-600">{chosenOptionText}</span>
+                              </div>
+                            </div>
+
+                            {/* NÚT TICK ĐÚNG / SAI */}
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleToggleQuestionMark(qKey, 'correct', asgQuestions.length)
+                                }
+                                className={`inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg font-bold text-xs border transition ${
+                                  mark === 'correct'
+                                    ? 'bg-emerald-600 text-white border-emerald-600 shadow-sm'
+                                    : 'bg-white text-emerald-700 border-emerald-300 hover:bg-emerald-50'
+                                }`}
+                              >
+                                <Check className="w-3.5 h-3.5" />
+                                <span>Đúng</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleToggleQuestionMark(qKey, 'wrong', asgQuestions.length)
+                                }
+                                className={`inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg font-bold text-xs border transition ${
+                                  mark === 'wrong'
+                                    ? 'bg-rose-600 text-white border-rose-600 shadow-sm'
+                                    : 'bg-white text-rose-700 border-rose-300 hover:bg-rose-50'
+                                }`}
+                              >
+                                <X className="w-3.5 h-3.5" />
+                                <span>Sai</span>
+                              </button>
+                            </div>
+                          </div>
+
+                          {mark === 'wrong' && (
+                            <div className="pt-1">
+                              <input
+                                type="text"
+                                placeholder="Ghi chú đáp án đúng cho học sinh xem (VD: B hoặc giải thích ngắn)..."
+                                value={gradeQuestionNotes[qKey] || ''}
+                                onChange={(e) =>
+                                  setGradeQuestionNotes((prev) => ({
+                                    ...prev,
+                                    [qKey]: e.target.value
+                                  }))
+                                }
+                                className="w-full px-2.5 py-1.5 text-xs bg-white border border-rose-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-rose-500"
+                              />
+                            </div>
+                          )}
                         </div>
-                        <div className="text-indigo-700 font-semibold">
-                          → Học sinh trả lời: {stuVal}
-                        </div>
-                      </div>
-                    );
-                  })}
+                      );
+                    })}
+                  </div>
                 </div>
               ) : (
                 reviewingSubmission.answer_text && (
@@ -2536,20 +2761,20 @@ export default function App() {
                 )
               )}
 
-              <div className="grid sm:grid-cols-2 gap-3">
+              <div className="grid sm:grid-cols-2 gap-3 pt-1">
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Điểm số (0 - 10) *
+                    Điểm tổng (0 - 10) * <span className="text-[11px] font-normal text-slate-400">(Tự tính khi tick hoặc nhập tay)</span>
                   </label>
                   <input
                     type="number"
-                    step="0.25"
+                    step="0.05"
                     min="0"
                     max="10"
                     required
                     value={gradeScore}
                     onChange={(e) => setGradeScore(e.target.value)}
-                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-xl"
+                    className="w-full px-3 py-2 text-sm font-bold text-indigo-700 border border-slate-300 rounded-xl"
                   />
                 </div>
 
@@ -2559,7 +2784,7 @@ export default function App() {
                   </label>
                   <input
                     type="text"
-                    placeholder="VD: Hình học không gian"
+                    placeholder="VD: Reported speech"
                     value={gradeWeakTopic}
                     onChange={(e) => setGradeWeakTopic(e.target.value)}
                     className="w-full px-3 py-2 text-sm border border-slate-300 rounded-xl"
@@ -2569,7 +2794,7 @@ export default function App() {
 
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  Nhận xét & Lỗi sai cần sửa
+                  Nhận xét tổng quát gửi trả học sinh
                 </label>
                 <textarea
                   rows={2}
@@ -2582,9 +2807,9 @@ export default function App() {
 
               <button
                 type="submit"
-                className="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-sm"
+                className="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-sm shadow-sm"
               >
-                Lưu điểm & Gửi trả kết quả
+                Lưu điểm ({gradeScore}/10) & Gửi trả từng câu Đúng/Sai cho học sinh
               </button>
             </form>
           </div>
@@ -2758,22 +2983,61 @@ export default function App() {
               </div>
 
               <div className="space-y-3">
-                <h2 className="font-bold text-slate-900 text-sm">Chi tiết điểm & nhận xét từng bài đã nộp</h2>
+                <h2 className="font-bold text-slate-900 text-sm">Chi tiết điểm & từng câu Đúng / Sai</h2>
                 {studentPortalData.mySubs.map((sub) => {
                   const asg = assignments.find((a) => a.id === sub.assignment_id);
                   const fb = sub.ai_feedback_json || {};
+                  const breakdown = Array.isArray(fb.breakdown) ? fb.breakdown : [];
+
                   return (
-                    <div key={sub.id} className="bg-white p-4 rounded-2xl border border-slate-200 space-y-2">
+                    <div key={sub.id} className="bg-white p-4 rounded-2xl border border-slate-200 space-y-3">
                       <div className="flex items-center justify-between">
                         <div className="font-bold text-sm text-slate-900">{asg?.title || 'Bài tập'}</div>
                         <span className="px-2.5 py-0.5 rounded-full bg-indigo-50 text-indigo-700 font-bold text-xs">
                           {sub.score !== null ? `${sub.score}/10 điểm` : 'Chờ giáo viên chấm'}
                         </span>
                       </div>
+
                       {fb.summary && <p className="text-xs text-slate-700">{fb.summary}</p>}
+
+                      {/* HIỂN THỊ TỪNG CÂU ĐÚNG / SAI CHO HỌC SINH */}
+                      {breakdown.length > 0 && (
+                        <div className="space-y-1.5">
+                          <div className="text-[11px] font-bold text-slate-600">
+                            Kết quả chi tiết từng câu:
+                          </div>
+                          <div className="flex flex-wrap gap-1.5">
+                            {breakdown.map((item, idx) => (
+                              <span
+                                key={idx}
+                                title={
+                                  item.status === 'correct'
+                                    ? `Câu ${item.question}: Đúng (${item.actual})`
+                                    : `Câu ${item.question}: Sai — Em chọn "${item.actual}"${
+                                        item.expected ? ` (Đúng: ${item.expected})` : ''
+                                      }`
+                                }
+                                className={`inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-bold border ${
+                                  item.status === 'correct'
+                                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                    : 'bg-rose-50 text-rose-700 border-rose-200'
+                                }`}
+                              >
+                                <span>Câu {item.question}</span>
+                                {item.status === 'correct' ? (
+                                  <Check className="w-3 h-3" />
+                                ) : (
+                                  <X className="w-3 h-3" />
+                                )}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
                       {Array.isArray(fb.wrongDetails) && fb.wrongDetails.length > 0 && (
                         <div className="p-3 rounded-xl bg-rose-50 text-xs text-rose-800 space-y-1">
-                          <div className="font-bold">Chi tiết chỗ sai cần sửa:</div>
+                          <div className="font-bold">Chi tiết các câu sai cần xem lại:</div>
                           {fb.wrongDetails.map((line, i) => (
                             <div key={i}>• {line}</div>
                           ))}
