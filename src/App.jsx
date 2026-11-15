@@ -511,11 +511,14 @@ export default function App() {
   const [geminiApiKey, setGeminiApiKey] = useState(() => localStorage.getItem('sc_gemini_key') || '');
   const [showAiKeyInput, setShowAiKeyInput] = useState(false);
 
-  // Bài ôn bổ trợ riêng
+  // Bài ôn bổ trợ riêng (Tự động gom câu đã sai + đính kèm file Word/PDF tùy chọn)
   const [remTitle, setRemTitle] = useState('');
   const [remTopic, setRemTopic] = useState('');
   const [remAnswerKey, setRemAnswerKey] = useState('');
   const [remNote, setRemNote] = useState('');
+  const [selectedWrongUids, setSelectedWrongUids] = useState([]);
+  const [remSourceFile, setRemSourceFile] = useState(null);
+  const [isAssigningRemedial, setIsAssigningRemedial] = useState(false);
 
   // Chấm bài thủ công & sửa điểm
   const [gradeScore, setGradeScore] = useState('8.5');
@@ -551,11 +554,11 @@ export default function App() {
     setLoading(true);
     try {
       const [clsRes, stuRes, asgRes, subRes, annRes] = await Promise.all([
-        supabase.from('classes').select('*').order('created_at', { ascending: true }),
-        supabase.from('students').select('*').order('student_code', { ascending: true }),
-        supabase.from('assignments').select('*').order('created_at', { ascending: false }),
-        supabase.from('submissions').select('*').order('submitted_at', { ascending: false }),
-        supabase.from('announcements').select('*').order('created_at', { ascending: false })
+        supabase.from('classes').select('*').order('created_at', { ascending: true }).limit(2000),
+        supabase.from('students').select('*').order('student_code', { ascending: true }).limit(5000),
+        supabase.from('assignments').select('*').order('created_at', { ascending: false }).limit(5000),
+        supabase.from('submissions').select('*').order('submitted_at', { ascending: false }).limit(10000),
+        supabase.from('announcements').select('*').order('created_at', { ascending: false }).limit(5000)
       ]);
 
       if (clsRes.data) {
@@ -1095,38 +1098,7 @@ export default function App() {
     }
   };
 
-  const handleAssignRemedial = async (e) => {
-    e.preventDefault();
-    if (!deepDiveStudent || !remTitle.trim() || !supabase) return;
-    const { error } = await supabase.from('assignments').insert([
-      {
-        title: remTitle.trim(),
-        class_id: deepDiveStudent.class_id,
-        class_name: deepDiveStudent.class_name,
-        target_student_id: deepDiveStudent.id,
-        week_number: 0,
-        due_date: new Date(Date.now() + 3 * 86400000).toISOString().slice(0, 10),
-        topic: remTopic.trim() || 'Ôn tập bổ trợ',
-        answer_key_text: remAnswerKey.trim(),
-        rubric: remNote.trim(),
-        is_remedial: true
-      }
-    ]);
 
-    if (!error) {
-      await supabase.from('announcements').insert([
-        {
-          target_student_id: deepDiveStudent.id,
-          message: `Giáo viên vừa giao bài ôn bổ trợ riêng "${remTitle.trim()}" cho phần ${remTopic || 'cần củng cố'}.`
-        }
-      ]);
-      setRemTitle('');
-      setRemAnswerKey('');
-      setRemNote('');
-      notify(`Đã giao bài ôn riêng cho ${deepDiveStudent.full_name}!`);
-      fetchAllData();
-    }
-  };
 
   const handleSendReminder = async (student, customMsg = '') => {
     if (!supabase) return;
@@ -1964,11 +1936,294 @@ export default function App() {
       };
     });
 
+    // Kiểm tra các câu sai cũ nào đã được em làm lại đúng trong bài ôn bổ trợ
+    const masteredSourceUids = new Set();
+    report.submissions.forEach((sub) => {
+      const asg = assignments.find((a) => a.id === sub.assignment_id);
+      if (!asg?.is_remedial) return;
+      const qList = getAssignmentQuestions(asg);
+      const breakdown = sub.ai_feedback_json?.breakdown || [];
+      breakdown.forEach((b) => {
+        if (b.status === 'correct') {
+          const matchedQ = qList.find((q) => String(q.number) === String(b.question));
+          if (matchedQ?.sourceUid) {
+            masteredSourceUids.add(matchedQ.sourceUid);
+          }
+        }
+      });
+    });
+
+    // Tự động gom toàn bộ câu hỏi học sinh từng làm sai (kèm nguyên đoạn văn đọc hiểu, phương án, đáp án & giải thích)
+    const wrongMap = new Map();
+    report.submissions.forEach((sub) => {
+      const asg = assignments.find((a) => a.id === sub.assignment_id);
+      if (!asg || asg.is_remedial) return;
+
+      const asgQuestions = getAssignmentQuestions(asg);
+      const breakdown = sub.ai_feedback_json?.breakdown || [];
+      const ansMap = sub.answers_json || sub.ai_feedback_json?.studentAnswersMap || {};
+
+      if (breakdown.length > 0) {
+        breakdown.forEach((b) => {
+          if (b.status !== 'wrong') return;
+          const qNumStr = String(b.question);
+          const origQ = asgQuestions.find((q) => String(q.number) === qNumStr);
+          const uid = `${asg.id}__${qNumStr}`;
+          if (!wrongMap.has(uid)) {
+            wrongMap.set(uid, {
+              uid,
+              sourceAssignmentId: asg.id,
+              sourceAssignmentTitle: asg.title,
+              sourceQuestionNumber: Number(qNumStr) || 0,
+              sourceTopic: asg.topic || 'Tổng hợp',
+              type: origQ?.type === 'mcq' ? 'mcq' : 'open',
+              passage: origQ?.passage || '',
+              text: origQ?.text || `Câu ${qNumStr} (${asg.title})`,
+              options: origQ?.options || { A: '', B: '', C: '', D: '' },
+              correctAnswer: origQ?.correctAnswer || b.expected || '',
+              explanation: origQ?.explanation || b.explanation || '',
+              previousAnswer: b.actual || ansMap[qNumStr] || '(Bỏ trống)',
+              isAlreadyFixed: masteredSourceUids.has(uid)
+            });
+          }
+        });
+      } else if (asgQuestions.length > 0 && sub.score !== null && sub.score !== undefined) {
+        asgQuestions.forEach((origQ) => {
+          const qNumStr = String(origQ.number);
+          const expected = String(origQ.correctAnswer || '').trim();
+          if (!expected) return;
+          const actual = String(ansMap[qNumStr] || '').trim();
+          const isRight =
+            actual !== '' &&
+            actual.toLowerCase().replace(/\s+/g, '') === expected.toLowerCase().replace(/\s+/g, '');
+          if (!isRight) {
+            const uid = `${asg.id}__${qNumStr}`;
+            if (!wrongMap.has(uid)) {
+              wrongMap.set(uid, {
+                uid,
+                sourceAssignmentId: asg.id,
+                sourceAssignmentTitle: asg.title,
+                sourceQuestionNumber: origQ.number,
+                sourceTopic: asg.topic || 'Tổng hợp',
+                type: origQ.type === 'mcq' ? 'mcq' : 'open',
+                passage: origQ.passage || '',
+                text: origQ.text,
+                options: origQ.options || { A: '', B: '', C: '', D: '' },
+                correctAnswer: expected,
+                explanation: origQ.explanation || '',
+                previousAnswer: actual || '(Bỏ trống)',
+                isAlreadyFixed: masteredSourceUids.has(uid)
+              });
+            }
+          }
+        });
+      }
+    });
+
+    const wrongQuestionsPool = Array.from(wrongMap.values());
+    const unfixedWrongQuestions = wrongQuestionsPool.filter((q) => !q.isAlreadyFixed);
+
     return {
       ...report,
-      trend
+      trend,
+      wrongQuestionsPool,
+      unfixedWrongQuestions
     };
   }, [deepDiveStudent, buildIndividualStudentReport, assignments]);
+
+  // Tự động chọn sẵn toàn bộ câu sai chưa khắc phục mỗi khi mở Deep-dive của 1 học sinh
+  useEffect(() => {
+    if (!deepDiveStudent || !deepDiveData) return;
+    const defaultList =
+      deepDiveData.unfixedWrongQuestions.length > 0
+        ? deepDiveData.unfixedWrongQuestions
+        : deepDiveData.wrongQuestionsPool;
+
+    setSelectedWrongUids(defaultList.map((q) => q.uid));
+    setRemSourceFile(null);
+    setRemAnswerKey('');
+    setRemNote('');
+    if (defaultList.length > 0) {
+      setRemTitle(`Luyện lại ${defaultList.length} câu đã sai — ${deepDiveStudent.full_name}`);
+    } else {
+      setRemTitle(
+        deepDiveData.weakList[0]?.[0]
+          ? `Ôn tập bổ trợ: ${deepDiveData.weakList[0][0]}`
+          : 'Bài luyện tập củng cố'
+      );
+    }
+  }, [deepDiveStudent?.id]);
+
+  const handleAssignRemedial = useCallback(
+    async (e) => {
+      e.preventDefault();
+      if (!deepDiveStudent || !supabase || isAssigningRemedial) return;
+
+      const selectedQuestions = (deepDiveData?.wrongQuestionsPool || []).filter((q) =>
+        selectedWrongUids.includes(q.uid)
+      );
+
+      if (selectedQuestions.length === 0 && !remSourceFile && !remTitle.trim()) {
+        notify('Anh vui lòng chọn ít nhất 1 câu đã sai hoặc đính kèm file đề!', 'error');
+        return;
+      }
+
+      setIsAssigningRemedial(true);
+      try {
+        let uploadedFileUrl = null;
+        let uploadedFileName = null;
+        let parsedExternalQuestions = [];
+
+        if (remSourceFile) {
+          const cleanName = remSourceFile.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+          const path = `remedial/${deepDiveStudent.student_code}_${Date.now()}_${cleanName}`;
+          const { error: upErr } = await supabase.storage
+            .from('homework-files')
+            .upload(path, remSourceFile, { upsert: true });
+          if (!upErr) {
+            const { data: pub } = supabase.storage.from('homework-files').getPublicUrl(path);
+            uploadedFileUrl = pub?.publicUrl || null;
+            uploadedFileName = remSourceFile.name;
+          }
+
+          // Nếu không dùng bộ câu sai mà up file đề ngoài -> tự bóc tách câu hỏi từ file Word/PDF luôn
+          if (selectedQuestions.length === 0) {
+            try {
+              const extracted = await extractRawContentFromFile(remSourceFile);
+              parsedExternalQuestions = parseQuestionsFromExtractedContent(extracted);
+            } catch {
+              parsedExternalQuestions = [];
+            }
+          }
+        }
+
+        const compiledQuestions =
+          selectedQuestions.length > 0
+            ? selectedQuestions.map((q, idx) => ({
+                id: `rem-q-${idx + 1}-${Date.now()}`,
+                number: idx + 1,
+                type: q.type === 'mcq' ? 'mcq' : 'open',
+                passage: q.passage || '',
+                text: q.text,
+                options: q.options || { A: '', B: '', C: '', D: '' },
+                correctAnswer: q.correctAnswer || '',
+                explanation: q.explanation || '',
+                sourceUid: q.uid,
+                sourceHint: `${q.sourceAssignmentTitle} — Câu ${q.sourceQuestionNumber}`,
+                previousWrongAnswer: q.previousAnswer || ''
+              }))
+            : parsedExternalQuestions.map((q, idx) => ({
+                ...q,
+                type: q.type === 'mcq' ? 'mcq' : 'open',
+                number: idx + 1
+              }));
+
+        const finalTitle =
+          remTitle.trim() ||
+          (selectedQuestions.length > 0
+            ? `Luyện lại ${selectedQuestions.length} câu đã sai — ${deepDiveStudent.full_name}`
+            : remSourceFile
+            ? `Bài ôn bổ trợ: ${remSourceFile.name.replace(/\.[^/.]+$/, '')}`
+            : 'Bài ôn tập bổ trợ');
+
+        const finalAnswerKey =
+          compiledQuestions.length > 0
+            ? compiledQuestions
+                .filter((q) => q.correctAnswer)
+                .map((q) => `${q.number}:${q.correctAnswer}`)
+                .join(', ')
+            : remAnswerKey.trim();
+
+        const baseNote =
+          remNote.trim() ||
+          (selectedQuestions.length > 0
+            ? `Bộ ${selectedQuestions.length} câu em từng làm sai. Hãy tự suy nghĩ làm lại cẩn thận — đáp án & giải thích chi tiết sẽ mở ngay sau khi em nộp bài!`
+            : '');
+
+        const embeddedRubric =
+          compiledQuestions.length > 0
+            ? `${baseNote}\n__SC_QUESTIONS__:${JSON.stringify(compiledQuestions)}`
+            : baseNote;
+
+        const fullPayload = {
+          title: finalTitle,
+          class_id: deepDiveStudent.class_id,
+          class_name: deepDiveStudent.class_name,
+          target_student_id: deepDiveStudent.id,
+          week_number: 0,
+          due_date: new Date(Date.now() + 3 * 86400000).toISOString().slice(0, 10),
+          topic: remTopic.trim() || 'Luyện lại câu sai',
+          answer_key_text: finalAnswerKey,
+          answer_key_url: uploadedFileUrl,
+          rubric: embeddedRubric,
+          is_remedial: true,
+          questions_json: compiledQuestions,
+          source_file_url: uploadedFileUrl,
+          source_file_name: uploadedFileName
+        };
+
+        let { error } = await supabase.from('assignments').insert([fullPayload]);
+
+        if (error && error.message?.includes('column')) {
+          const fallbackPayload = {
+            title: fullPayload.title,
+            class_id: fullPayload.class_id,
+            class_name: fullPayload.class_name,
+            target_student_id: fullPayload.target_student_id,
+            week_number: 0,
+            due_date: fullPayload.due_date,
+            topic: fullPayload.topic,
+            answer_key_text: fullPayload.answer_key_text,
+            answer_key_url: uploadedFileUrl,
+            rubric: embeddedRubric,
+            is_remedial: true
+          };
+          const retry = await supabase.from('assignments').insert([fallbackPayload]);
+          error = retry.error;
+        }
+
+        if (error) throw error;
+
+        await supabase.from('announcements').insert([
+          {
+            target_student_id: deepDiveStudent.id,
+            message:
+              selectedQuestions.length > 0
+                ? `Giáo viên vừa giao bài "${finalTitle}" gồm ${selectedQuestions.length} câu em từng làm sai để em tự luyện lại và xem giải thích chi tiết!`
+                : `Giáo viên vừa giao bài ôn bổ trợ riêng "${finalTitle}" cho phần ${remTopic || 'cần củng cố'}.`
+          }
+        ]);
+
+        setRemSourceFile(null);
+        setRemAnswerKey('');
+        setRemNote('');
+        notify(
+          selectedQuestions.length > 0
+            ? `Đã giao bài luyện lại ${selectedQuestions.length} câu đã sai cho ${deepDiveStudent.full_name}!`
+            : `Đã giao bài ôn bổ trợ riêng cho ${deepDiveStudent.full_name}!`
+        );
+        fetchAllData();
+      } catch (err) {
+        notify('Lỗi giao bài ôn riêng: ' + err.message, 'error');
+      } finally {
+        setIsAssigningRemedial(false);
+      }
+    },
+    [
+      deepDiveStudent,
+      supabase,
+      isAssigningRemedial,
+      deepDiveData,
+      selectedWrongUids,
+      remSourceFile,
+      remTitle,
+      remAnswerKey,
+      remNote,
+      remTopic,
+      notify,
+      fetchAllData
+    ]
+  );
 
   const handleDismissAnnouncement = (annId) => {
     const next = [...dismissedAnnIds, annId];
@@ -3919,36 +4174,169 @@ export default function App() {
 
               <form
                 onSubmit={handleAssignRemedial}
-                className="p-4 rounded-xl bg-indigo-50/70 border border-indigo-200 space-y-2.5"
+                className="p-4 rounded-xl bg-indigo-50/70 border border-indigo-200 space-y-3"
               >
-                <h3 className="text-sm font-bold text-indigo-950">Giao bài ôn bổ trợ riêng cho em</h3>
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-sm font-bold text-indigo-950">
+                    Giao bài ôn bổ trợ riêng cho em
+                  </h3>
+                  {deepDiveData.wrongQuestionsPool.length > 0 && (
+                    <span className="px-2 py-0.5 rounded-md bg-rose-100 text-rose-800 text-[11px] font-bold">
+                      Gom được {deepDiveData.wrongQuestionsPool.length} câu sai
+                    </span>
+                  )}
+                </div>
+
+                {/* DANH SÁCH TỰ ĐỘNG GOM TOÀN BỘ CÂU HỌC SINH TỪNG LÀM SAI */}
+                {deepDiveData.wrongQuestionsPool.length > 0 ? (
+                  <div className="space-y-2 bg-white p-3 rounded-xl border border-indigo-200">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="font-bold text-slate-700">
+                        Chọn câu sai giao làm lại ({selectedWrongUids.length}/{deepDiveData.wrongQuestionsPool.length} câu):
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const allUids = deepDiveData.wrongQuestionsPool.map((q) => q.uid);
+                            setSelectedWrongUids(allUids);
+                            setRemTitle(
+                              `Luyện lại ${allUids.length} câu đã sai — ${deepDiveStudent.full_name}`
+                            );
+                          }}
+                          className="text-indigo-600 font-semibold hover:underline"
+                        >
+                          Chọn tất cả
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setSelectedWrongUids([])}
+                          className="text-slate-400 hover:text-slate-600"
+                        >
+                          Bỏ chọn
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="max-h-44 overflow-y-auto space-y-1.5 pr-1">
+                      {deepDiveData.wrongQuestionsPool.map((wq) => {
+                        const checked = selectedWrongUids.includes(wq.uid);
+                        return (
+                          <label
+                            key={wq.uid}
+                            className={`flex items-start gap-2 p-2 rounded-lg border text-[11px] cursor-pointer transition ${
+                              checked
+                                ? 'bg-indigo-50/70 border-indigo-300'
+                                : 'bg-slate-50 border-slate-200 opacity-75'
+                            }`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={(e) => {
+                                const next = e.target.checked
+                                  ? [...selectedWrongUids, wq.uid]
+                                  : selectedWrongUids.filter((id) => id !== wq.uid);
+                                setSelectedWrongUids(next);
+                                if (next.length > 0) {
+                                  setRemTitle(
+                                    `Luyện lại ${next.length} câu đã sai — ${deepDiveStudent.full_name}`
+                                  );
+                                }
+                              }}
+                              className="mt-0.5 rounded text-indigo-600 shrink-0"
+                            />
+                            <div className="min-w-0 flex-1 space-y-0.5">
+                              <div className="flex flex-wrap items-center gap-1">
+                                <span className="font-bold text-indigo-700">
+                                  [{wq.sourceAssignmentTitle} - Câu {wq.sourceQuestionNumber}]
+                                </span>
+                                {wq.passage && (
+                                  <span className="px-1.5 py-0.2 rounded bg-amber-100 text-amber-800 font-semibold">
+                                    📖 Kèm bài đọc
+                                  </span>
+                                )}
+                                {wq.isAlreadyFixed && (
+                                  <span className="px-1.5 py-0.2 rounded bg-emerald-100 text-emerald-700 font-semibold">
+                                    ✓ Đã sửa đúng
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-slate-800 line-clamp-2">{wq.text}</div>
+                              <div className="text-slate-500">
+                                Em chọn: <span className="text-rose-600 font-semibold">{wq.previousAnswer}</span>
+                                {wq.correctAnswer && (
+                                  <>
+                                    {' '}• Đúng: <span className="text-emerald-700 font-semibold">{wq.correctAnswer}</span>
+                                  </>
+                                )}
+                              </div>
+                            </div>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="p-2.5 rounded-lg bg-white/80 border border-indigo-100 text-[11px] text-slate-600">
+                    Chưa có câu sai nào được ghi nhận từ các bài trước. Anh có thể đính kèm file Word/PDF bên dưới để giao đề ôn riêng cho em.
+                  </div>
+                )}
+
                 <input
                   type="text"
                   required
-                  placeholder="Tên bài ôn thêm"
+                  placeholder="Tên bài ôn bổ trợ"
                   value={remTitle}
                   onChange={(e) => setRemTitle(e.target.value)}
                   className="w-full px-3 py-1.5 text-xs bg-white border border-indigo-200 rounded-lg"
                 />
-                <input
-                  type="text"
-                  placeholder="Chuyên đề cần củng cố"
-                  value={remTopic}
-                  onChange={(e) => setRemTopic(e.target.value)}
-                  className="w-full px-3 py-1.5 text-xs bg-white border border-indigo-200 rounded-lg"
-                />
-                <input
-                  type="text"
-                  placeholder="Đáp án tự chấm (VD: 1:A, 2:B)"
-                  value={remAnswerKey}
-                  onChange={(e) => setRemAnswerKey(e.target.value)}
-                  className="w-full px-3 py-1.5 text-xs bg-white border border-indigo-200 rounded-lg"
-                />
+
+                <div className="grid grid-cols-2 gap-2">
+                  <input
+                    type="text"
+                    placeholder="Chuyên đề (VD: Luyện câu sai)"
+                    value={remTopic}
+                    onChange={(e) => setRemTopic(e.target.value)}
+                    className="w-full px-3 py-1.5 text-xs bg-white border border-indigo-200 rounded-lg"
+                  />
+                  <label className="flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white border border-dashed border-indigo-300 hover:bg-indigo-50 cursor-pointer text-[11px] font-semibold text-indigo-700 truncate">
+                    <FileUp className="w-3.5 h-3.5 shrink-0" />
+                    <span className="truncate">
+                      {remSourceFile ? remSourceFile.name : '+ Đính kèm Word/PDF'}
+                    </span>
+                    <input
+                      type="file"
+                      accept=".docx,.pdf,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                      onChange={(e) => setRemSourceFile(e.target.files?.[0] || null)}
+                      className="hidden"
+                    />
+                  </label>
+                </div>
+
+                {remSourceFile && (
+                  <div className="flex items-center justify-between px-2.5 py-1 rounded-lg bg-white border border-indigo-200 text-[11px] text-slate-700">
+                    <span className="truncate">📎 File đính kèm: {remSourceFile.name}</span>
+                    <button
+                      type="button"
+                      onClick={() => setRemSourceFile(null)}
+                      className="text-rose-600 font-bold ml-2 shrink-0"
+                    >
+                      Gỡ
+                    </button>
+                  </div>
+                )}
+
                 <button
                   type="submit"
-                  className="w-full py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold"
+                  disabled={isAssigningRemedial}
+                  className="w-full py-2.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white text-xs font-bold shadow-sm transition"
                 >
-                  Giao ngay cho {deepDiveStudent.full_name}
+                  {isAssigningRemedial
+                    ? 'Đang giao bài...'
+                    : selectedWrongUids.length > 0
+                    ? `Giao bài luyện lại ${selectedWrongUids.length} câu đã sai`
+                    : `Giao bài ôn riêng cho ${deepDiveStudent.full_name}`}
                 </button>
               </form>
             </div>
@@ -4651,6 +5039,11 @@ export default function App() {
                                 <span className="inline-block px-2 py-0.5 rounded-md bg-indigo-600 text-white text-xs font-bold mr-2">
                                   Câu {q.number}
                                 </span>
+                                {q.sourceHint && (
+                                  <span className="inline-block px-2 py-0.5 rounded-md bg-amber-100 text-amber-800 text-[11px] font-semibold mr-2">
+                                    Luyện lại: {q.sourceHint}
+                                  </span>
+                                )}
                                 {q.text}
                               </div>
 
@@ -4739,8 +5132,13 @@ export default function App() {
                             )}
 
                             {/* HIỆN ĐÁP ÁN ĐÚNG & GIẢI THÍCH NGAY SAU KHI NỘP */}
-                            {isLockedReview && (q.correctAnswer || bItem?.expected || q.explanation || bItem?.explanation) && (
+                            {isLockedReview && (q.correctAnswer || bItem?.expected || q.explanation || bItem?.explanation || q.previousWrongAnswer) && (
                               <div className="p-2.5 rounded-xl bg-white border border-slate-200 text-xs space-y-1">
+                                {q.previousWrongAnswer && (
+                                  <div className="text-slate-500">
+                                    ↺ Lần làm trước em từng chọn: <span className="line-through text-rose-600 font-semibold">{q.previousWrongAnswer}</span>
+                                  </div>
+                                )}
                                 {(q.correctAnswer || bItem?.expected) && (
                                   <div className="text-emerald-700 font-bold">
                                     ✓ Đáp án chuẩn: {q.correctAnswer || bItem?.expected}
