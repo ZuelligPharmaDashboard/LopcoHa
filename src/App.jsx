@@ -983,7 +983,7 @@ export default function App() {
     e.preventDefault();
     setLoginError('');
     if (teacherPassInput.trim() !== TEACHER_PASSCODE) {
-      setLoginError('Mật khẩu giáo viên chưa đúng (Mặc định: 2026)');
+      setLoginError('Mật khẩu giáo viên chưa đúng');
       return;
     }
     setRole('teacher');
@@ -2795,7 +2795,7 @@ export default function App() {
                   <input
                     type="password"
                     required
-                    placeholder="Nhập mật khẩu (Mặc định: 2026)"
+                    placeholder="Nhập mật khẩu"
                     value={teacherPassInput}
                     onChange={(e) => setTeacherPassInput(e.target.value)}
                     className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-xl focus:ring-2 focus:ring-pink-500 outline-none"
