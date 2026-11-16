@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   Users,
   CheckCircle2,
@@ -33,7 +33,12 @@ import {
   RotateCcw,
   Shuffle,
   Lock,
-  Unlock
+  Unlock,
+  CalendarDays,
+  Wallet,
+  Download,
+  QrCode,
+  ClipboardList
 } from 'lucide-react';
 import {
   getSupabaseClient,
@@ -149,15 +154,28 @@ function getAssignmentMeta(asg) {
   return defaults;
 }
 
-// Đảo thứ tự câu hỏi theo mã học sinh (giữ nguyên số câu gốc q.number để đối chiếu đáp án & thống kê)
+// Đảo thứ tự câu hỏi theo mã học sinh (gom nhóm các câu chung 1 bài đọc hiểu để không tách rời đoạn văn)
 function getOrderedQuestionsForStudent(questions, studentCode, assignmentId, shouldShuffle) {
   if (!shouldShuffle || !Array.isArray(questions) || questions.length <= 1) {
     return questions;
   }
-  // Không đảo các câu chung một đoạn văn đọc hiểu để tránh tách rời bài đọc
-  if (questions.some((q) => Boolean(q.passage))) {
+
+  // Group consecutive questions sharing the same passage into intact blocks
+  const blocks = [];
+  questions.forEach((q) => {
+    const p = (q.passage || '').trim();
+    const lastBlock = blocks[blocks.length - 1];
+    if (p && lastBlock && lastBlock.passage === p) {
+      lastBlock.items.push(q);
+    } else {
+      blocks.push({ passage: p, items: [q] });
+    }
+  });
+
+  if (blocks.length <= 1) {
     return questions;
   }
+
   const seedStr = `${studentCode || 'HS'}_${assignmentId || 'ASG'}`;
   let seed = 2166136261;
   for (let i = 0; i < seedStr.length; i += 1) {
@@ -170,12 +188,12 @@ function getOrderedQuestionsForStudent(questions, studentCode, assignmentId, sho
     t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
-  const arr = [...questions];
-  for (let i = arr.length - 1; i > 0; i -= 1) {
+
+  for (let i = blocks.length - 1; i > 0; i -= 1) {
     const j = Math.floor(nextRand() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
+    [blocks[i], blocks[j]] = [blocks[j], blocks[i]];
   }
-  return arr;
+  return blocks.flatMap((b) => b.items);
 }
 
 function getCleanRubricText(asg) {
@@ -386,6 +404,1801 @@ function autoGradeLegacyTextAnswers(answerKeyRaw, studentAnswerRaw, topic) {
   };
 }
 
+// ============================================================================
+// SỔ ĐIỂM (VOCAB + CHẤM TAY), ĐIỂM DANH & HỌC PHÍ, VIETQR — HELPERS
+// ============================================================================
+
+// Metadata tags stored as rows in `announcements` (one row per tag per class, class_id = class)
+const SC_TAG_VOCAB = '__SC_VOCAB_SCORES__:';
+const SC_TAG_MANUAL = '__SC_MANUAL_GRADES__:';
+const SC_TAG_CLASS_CFG = '__SC_CLASS_CFG__:';
+const SC_TAG_ATTENDANCE = '__SC_ATTENDANCE__:';
+const SC_CLASS_META_TAGS = {
+  vocab: SC_TAG_VOCAB,
+  manual: SC_TAG_MANUAL,
+  classCfg: SC_TAG_CLASS_CFG,
+  attendance: SC_TAG_ATTENDANCE
+};
+
+// Payment account (Vietcombank)
+const SC_BANK = {
+  bin: '970436',
+  bankName: 'Vietcombank',
+  accountNo: '1032715226',
+  accountName: 'THAI THANH HA'
+};
+
+const SC_WEEKDAYS = [
+  { key: '1', short: 'T2', long: 'Thứ 2' },
+  { key: '2', short: 'T3', long: 'Thứ 3' },
+  { key: '3', short: 'T4', long: 'Thứ 4' },
+  { key: '4', short: 'T5', long: 'Thứ 5' },
+  { key: '5', short: 'T6', long: 'Thứ 6' },
+  { key: '6', short: 'T7', long: 'Thứ 7' },
+  { key: '7', short: 'CN', long: 'Chủ nhật' }
+];
+
+function scUid(prefix = 'id') {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function formatVnd(amount) {
+  const n = Math.round(Number(amount) || 0);
+  return `${n.toLocaleString('vi-VN')}đ`;
+}
+
+function stripVietnamese(str) {
+  return String(str || '')
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D');
+}
+
+function getCurrentYm() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
+function formatYmLabel(ym) {
+  const [y, m] = String(ym || '').split('-');
+  return y && m ? `${m}/${y}` : ym;
+}
+
+function getWeekdayKey(dateStr) {
+  const d = new Date(`${dateStr}T00:00:00`);
+  const js = d.getDay();
+  return String(js === 0 ? 7 : js);
+}
+
+function formatSessionDate(dateStr) {
+  const wd = SC_WEEKDAYS.find((w) => w.key === getWeekdayKey(dateStr));
+  const [, m, d] = String(dateStr).split('-');
+  return `${wd ? wd.short : ''} ${d}/${m}`;
+}
+
+// "9.5" -> 9.5 ; "18/20" -> 9 ; with column total (e.g. 20): "18" -> 9
+// Returns { value } | { missing: true } | null (blank / invalid)
+function parseScoreInput(raw, total = 0, allowMissing = false) {
+  const text = String(raw ?? '').trim();
+  if (!text) return null;
+  const lower = stripVietnamese(text).toLowerCase().replace(/\s+/g, '');
+  if (allowMissing && ['cn', 'x', 'chuanop', 'missing'].includes(lower)) {
+    return { missing: true };
+  }
+  const normalized = text.replace(/,/g, '.').replace(/\s+/g, '');
+  const frac = normalized.match(/^(\d+(?:\.\d+)?)\/(\d+(?:\.\d+)?)$/);
+  if (frac) {
+    const a = Number(frac[1]);
+    const b = Number(frac[2]);
+    if (!b || a > b) return null;
+    return { value: Number(((a / b) * 10).toFixed(2)) };
+  }
+  const num = Number(normalized.replace(/đ$/i, ''));
+  if (Number.isNaN(num) || num < 0) return null;
+  const t = Number(total) || 0;
+  if (t > 0) {
+    if (num > t) return null;
+    return { value: Number(((num / t) * 10).toFixed(2)) };
+  }
+  if (num > 10) return null;
+  return { value: Number(num.toFixed(2)) };
+}
+
+// Resolve a stored grid cell into a scoring status
+function resolveGridCell(cell, column, allowMissing) {
+  if (!cell) return { status: 'blank' };
+  if (allowMissing && cell.status === 'missing') return { status: 'missing', value: 0 };
+  const parsed = parseScoreInput(cell.raw, column?.total, false);
+  if (!parsed || parsed.missing) return { status: 'blank' };
+  return { status: 'graded', value: parsed.value };
+}
+
+function normalizeGridData(data, kind) {
+  const columns = Array.isArray(data?.columns) ? data.columns : [];
+  const cells = data?.cells && typeof data.cells === 'object' ? data.cells : {};
+  return {
+    columns: columns.map((c, idx) => ({
+      id: c.id || `${kind}_${idx}`,
+      label: c.label || (kind === 'vocab' ? `Tuần ${c.week || idx + 1}` : `Cột điểm ${idx + 1}`),
+      week: Number(c.week) || idx + 1,
+      total: Number(c.total) || 0,
+      date: c.date || new Date().toISOString().slice(0, 10)
+    })),
+    cells
+  };
+}
+
+// Build regular sessions of a month from the fixed weekly schedule
+function generateMonthSessions(schedule, ym) {
+  const [y, m] = String(ym).split('-').map(Number);
+  if (!y || !m || !schedule) return [];
+  const daysInMonth = new Date(y, m, 0).getDate();
+  const out = [];
+  for (let d = 1; d <= daysInMonth; d += 1) {
+    const dateStr = `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    const key = getWeekdayKey(dateStr);
+    if (Object.prototype.hasOwnProperty.call(schedule, key)) {
+      out.push({ id: dateStr, date: dateStr, time: schedule[key] || '', kind: 'regular' });
+    }
+  }
+  return out;
+}
+
+function resolveMonthData(attendanceData, classCfg, ym) {
+  const stored = attendanceData?.months?.[ym];
+  if (stored && Array.isArray(stored.sessions)) {
+    return {
+      sessions: [...stored.sessions].sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time)),
+      absent: stored.absent || {},
+      paid: stored.paid || {},
+      generated: false
+    };
+  }
+  return {
+    sessions: generateMonthSessions(classCfg?.schedule || {}, ym),
+    absent: {},
+    paid: {},
+    generated: true
+  };
+}
+
+function getStudentUnitPrice(studentMeta, classCfg) {
+  const custom = Number(studentMeta?.customPrice);
+  if (custom > 0) return { price: custom, isCustom: true };
+  return { price: Number(classCfg?.unitPrice) || 0, isCustom: false };
+}
+
+function computeStudentMonthTuition(student, monthData, classCfg, studentMeta) {
+  const sessionRows = monthData.sessions.map((sess) => {
+    const absentList = monthData.absent?.[sess.id] || [];
+    const present = !absentList.includes(student.id);
+    return { ...sess, present };
+  });
+  const presentCount = sessionRows.filter((s) => s.present).length;
+  const { price, isCustom } = getStudentUnitPrice(studentMeta, classCfg);
+  const paidInfo = monthData.paid?.[student.id] || null;
+  return {
+    sessionRows,
+    presentCount,
+    absentCount: sessionRows.length - presentCount,
+    unitPrice: price,
+    isCustomPrice: isCustom,
+    amount: presentCount * price,
+    paid: Boolean(paidInfo),
+    paidAt: typeof paidInfo === 'string' ? paidInfo : null
+  };
+}
+
+function buildTransferNote(student, className, ym) {
+  const raw = `${student?.full_name || ''} ${className || ''} T${formatYmLabel(ym).replace('/', ' ')}`;
+  return stripVietnamese(raw)
+    .toUpperCase()
+    .replace(/[^A-Z0-9 ]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 50);
+}
+
+// ---------------------------------------------------------------------------
+// VietQR (EMVCo) payload + self-contained QR encoder (byte mode, ECC level M)
+// ---------------------------------------------------------------------------
+function emvTlv(id, value) {
+  const v = String(value);
+  return `${id}${String(v.length).padStart(2, '0')}${v}`;
+}
+
+function crc16Ccitt(str) {
+  let crc = 0xffff;
+  for (let i = 0; i < str.length; i += 1) {
+    crc ^= str.charCodeAt(i) << 8;
+    for (let j = 0; j < 8; j += 1) {
+      crc = crc & 0x8000 ? ((crc << 1) ^ 0x1021) & 0xffff : (crc << 1) & 0xffff;
+    }
+  }
+  return crc.toString(16).toUpperCase().padStart(4, '0');
+}
+
+function buildVietQrPayload({ amount = 0, addInfo = '' } = {}) {
+  const beneficiary = emvTlv('00', SC_BANK.bin) + emvTlv('01', SC_BANK.accountNo);
+  const merchantInfo =
+    emvTlv('00', 'A000000727') + emvTlv('01', beneficiary) + emvTlv('02', 'QRIBFTTA');
+  const amt = Math.round(Number(amount) || 0);
+  let payload =
+    emvTlv('00', '01') +
+    emvTlv('01', amt > 0 ? '12' : '11') +
+    emvTlv('38', merchantInfo) +
+    emvTlv('53', '704') +
+    (amt > 0 ? emvTlv('54', String(amt)) : '') +
+    emvTlv('58', 'VN');
+  const note = stripVietnamese(addInfo).replace(/[^A-Za-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (note) payload += emvTlv('62', emvTlv('08', note.slice(0, 50)));
+  payload += '6304';
+  return payload + crc16Ccitt(payload);
+}
+
+const QR_M_ECC_PER_BLOCK = [
+  -1, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26, 30, 22, 22, 24, 24, 28, 28, 26, 26, 26, 26, 28, 28, 28,
+  28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28
+];
+const QR_M_NUM_BLOCKS = [
+  -1, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5, 5, 8, 9, 9, 10, 10, 11, 13, 14, 16, 17, 17, 18, 20, 21, 23, 25,
+  26, 28, 29, 31, 33, 35, 37, 38, 40, 43, 45, 47, 49
+];
+
+function qrRawModules(ver) {
+  let result = (16 * ver + 128) * ver + 64;
+  if (ver >= 2) {
+    const numAlign = Math.floor(ver / 7) + 2;
+    result -= (25 * numAlign - 10) * numAlign - 55;
+    if (ver >= 7) result -= 36;
+  }
+  return result;
+}
+
+function qrDataCodewords(ver) {
+  return Math.floor(qrRawModules(ver) / 8) - QR_M_ECC_PER_BLOCK[ver] * QR_M_NUM_BLOCKS[ver];
+}
+
+function qrGfMul(x, y) {
+  let z = 0;
+  for (let i = 7; i >= 0; i -= 1) {
+    z = (z << 1) ^ ((z >>> 7) * 0x11d);
+    z ^= ((y >>> i) & 1) * x;
+  }
+  return z & 0xff;
+}
+
+function qrRsDivisor(degree) {
+  const result = new Array(degree).fill(0);
+  result[degree - 1] = 1;
+  let root = 1;
+  for (let i = 0; i < degree; i += 1) {
+    for (let j = 0; j < result.length; j += 1) {
+      result[j] = qrGfMul(result[j], root);
+      if (j + 1 < result.length) result[j] ^= result[j + 1];
+    }
+    root = qrGfMul(root, 0x02);
+  }
+  return result;
+}
+
+function qrRsRemainder(data, divisor) {
+  const result = divisor.map(() => 0);
+  data.forEach((b) => {
+    const factor = b ^ result.shift();
+    result.push(0);
+    divisor.forEach((coef, i) => {
+      result[i] ^= qrGfMul(coef, factor);
+    });
+  });
+  return result;
+}
+
+function encodeQrMatrix(text) {
+  const bytes = Array.from(new TextEncoder().encode(text));
+  let ver = 1;
+  for (; ver <= 40; ver += 1) {
+    const used = 4 + (ver < 10 ? 8 : 16) + bytes.length * 8;
+    if (used <= qrDataCodewords(ver) * 8) break;
+  }
+  if (ver > 40) throw new Error('QR data too long');
+
+  const bits = [];
+  const put = (val, len) => {
+    for (let i = len - 1; i >= 0; i -= 1) bits.push((val >>> i) & 1);
+  };
+  put(0x4, 4);
+  put(bytes.length, ver < 10 ? 8 : 16);
+  bytes.forEach((b) => put(b, 8));
+  const capacity = qrDataCodewords(ver) * 8;
+  put(0, Math.min(4, capacity - bits.length));
+  put(0, (8 - (bits.length % 8)) % 8);
+  for (let pad = 0xec; bits.length < capacity; pad ^= 0xec ^ 0x11) put(pad, 8);
+
+  const dataCw = [];
+  for (let i = 0; i < bits.length; i += 8) {
+    let v = 0;
+    for (let j = 0; j < 8; j += 1) v = (v << 1) | bits[i + j];
+    dataCw.push(v);
+  }
+
+  const numBlocks = QR_M_NUM_BLOCKS[ver];
+  const eccLen = QR_M_ECC_PER_BLOCK[ver];
+  const rawCw = Math.floor(qrRawModules(ver) / 8);
+  const numShort = numBlocks - (rawCw % numBlocks);
+  const shortLen = Math.floor(rawCw / numBlocks);
+  const divisor = qrRsDivisor(eccLen);
+  const blocks = [];
+  for (let i = 0, k = 0; i < numBlocks; i += 1) {
+    const dat = dataCw.slice(k, k + shortLen - eccLen + (i < numShort ? 0 : 1));
+    k += dat.length;
+    const ecc = qrRsRemainder(dat, divisor);
+    if (i < numShort) dat.push(0);
+    blocks.push(dat.concat(ecc));
+  }
+  const allCw = [];
+  for (let i = 0; i < blocks[0].length; i += 1) {
+    blocks.forEach((block, j) => {
+      if (i !== shortLen - eccLen || j >= numShort) allCw.push(block[i]);
+    });
+  }
+
+  const size = ver * 4 + 17;
+  const mod = Array.from({ length: size }, () => new Array(size).fill(false));
+  const fn = Array.from({ length: size }, () => new Array(size).fill(false));
+  const setFn = (x, y, dark) => {
+    mod[y][x] = dark;
+    fn[y][x] = true;
+  };
+
+  for (let i = 0; i < size; i += 1) {
+    setFn(6, i, i % 2 === 0);
+    setFn(i, 6, i % 2 === 0);
+  }
+  const finder = (cx, cy) => {
+    for (let dy = -4; dy <= 4; dy += 1) {
+      for (let dx = -4; dx <= 4; dx += 1) {
+        const dist = Math.max(Math.abs(dx), Math.abs(dy));
+        const x = cx + dx;
+        const y = cy + dy;
+        if (x >= 0 && x < size && y >= 0 && y < size) setFn(x, y, dist !== 2 && dist !== 4);
+      }
+    }
+  };
+  finder(3, 3);
+  finder(size - 4, 3);
+  finder(3, size - 4);
+
+  if (ver > 1) {
+    const numAlign = Math.floor(ver / 7) + 2;
+    const step = Math.floor((ver * 8 + numAlign * 3 + 5) / (numAlign * 4 - 4)) * 2;
+    const pos = [6];
+    for (let p = size - 7; pos.length < numAlign; p -= step) pos.splice(1, 0, p);
+    pos.forEach((ax, i) =>
+      pos.forEach((ay, j) => {
+        const last = pos.length - 1;
+        if ((i === 0 && j === 0) || (i === 0 && j === last) || (i === last && j === 0)) return;
+        for (let dy = -2; dy <= 2; dy += 1) {
+          for (let dx = -2; dx <= 2; dx += 1) {
+            setFn(ax + dx, ay + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+          }
+        }
+      })
+    );
+  }
+
+  const drawFormat = (mask) => {
+    const data = (0 << 3) | mask; // ECC level M = 0b00
+    let rem = data;
+    for (let i = 0; i < 10; i += 1) rem = (rem << 1) ^ ((rem >>> 9) * 0x537);
+    const fbits = ((data << 10) | rem) ^ 0x5412;
+    const bit = (i) => ((fbits >>> i) & 1) !== 0;
+    for (let i = 0; i <= 5; i += 1) setFn(8, i, bit(i));
+    setFn(8, 7, bit(6));
+    setFn(8, 8, bit(7));
+    setFn(7, 8, bit(8));
+    for (let i = 9; i < 15; i += 1) setFn(14 - i, 8, bit(i));
+    for (let i = 0; i < 8; i += 1) setFn(size - 1 - i, 8, bit(i));
+    for (let i = 8; i < 15; i += 1) setFn(8, size - 15 + i, bit(i));
+    setFn(8, size - 8, true);
+  };
+
+  if (ver >= 7) {
+    let rem = ver;
+    for (let i = 0; i < 12; i += 1) rem = (rem << 1) ^ ((rem >>> 11) * 0x1f25);
+    const vbits = (ver << 12) | rem;
+    for (let i = 0; i < 18; i += 1) {
+      const b = ((vbits >>> i) & 1) !== 0;
+      const a = size - 11 + (i % 3);
+      const c = Math.floor(i / 3);
+      setFn(a, c, b);
+      setFn(c, a, b);
+    }
+  }
+  drawFormat(0);
+
+  let bitIdx = 0;
+  for (let right = size - 1; right >= 1; right -= 2) {
+    if (right === 6) right = 5;
+    for (let vert = 0; vert < size; vert += 1) {
+      for (let j = 0; j < 2; j += 1) {
+        const x = right - j;
+        const upward = ((right + 1) & 2) === 0;
+        const y = upward ? size - 1 - vert : vert;
+        if (!fn[y][x] && bitIdx < allCw.length * 8) {
+          mod[y][x] = ((allCw[bitIdx >>> 3] >>> (7 - (bitIdx & 7))) & 1) !== 0;
+          bitIdx += 1;
+        }
+      }
+    }
+  }
+
+  const masks = [
+    (x, y) => (x + y) % 2 === 0,
+    (x, y) => y % 2 === 0,
+    (x) => x % 3 === 0,
+    (x, y) => (x + y) % 3 === 0,
+    (x, y) => (Math.floor(x / 3) + Math.floor(y / 2)) % 2 === 0,
+    (x, y) => ((x * y) % 2) + ((x * y) % 3) === 0,
+    (x, y) => (((x * y) % 2) + ((x * y) % 3)) % 2 === 0,
+    (x, y) => (((x + y) % 2) + ((x * y) % 3)) % 2 === 0
+  ];
+  const applyMask = (m) => {
+    for (let y = 0; y < size; y += 1) {
+      for (let x = 0; x < size; x += 1) {
+        if (!fn[y][x] && masks[m](x, y)) mod[y][x] = !mod[y][x];
+      }
+    }
+  };
+  const penalty = () => {
+    let score = 0;
+    for (let y = 0; y < size; y += 1) {
+      let runX = 1;
+      let runY = 1;
+      for (let x = 1; x < size; x += 1) {
+        if (mod[y][x] === mod[y][x - 1]) {
+          runX += 1;
+          if (runX === 5) score += 3;
+          else if (runX > 5) score += 1;
+        } else runX = 1;
+        if (mod[x][y] === mod[x - 1][y]) {
+          runY += 1;
+          if (runY === 5) score += 3;
+          else if (runY > 5) score += 1;
+        } else runY = 1;
+      }
+    }
+    let dark = 0;
+    for (let y = 0; y < size; y += 1) {
+      for (let x = 0; x < size; x += 1) {
+        if (mod[y][x]) dark += 1;
+        if (
+          x < size - 1 &&
+          y < size - 1 &&
+          mod[y][x] === mod[y][x + 1] &&
+          mod[y][x] === mod[y + 1][x] &&
+          mod[y][x] === mod[y + 1][x + 1]
+        ) {
+          score += 3;
+        }
+      }
+    }
+    const total = size * size;
+    score += (Math.ceil(Math.abs(dark * 20 - total * 10) / total) - 1) * 10;
+    return score;
+  };
+
+  let bestMask = 0;
+  let bestScore = Infinity;
+  for (let m = 0; m < 8; m += 1) {
+    applyMask(m);
+    drawFormat(m);
+    const p = penalty();
+    if (p < bestScore) {
+      bestScore = p;
+      bestMask = m;
+    }
+    applyMask(m);
+  }
+  applyMask(bestMask);
+  drawFormat(bestMask);
+  return mod;
+}
+
+function drawQrOnContext(ctx, matrix, x, y, sizePx) {
+  const n = matrix.length;
+  const quiet = 4;
+  const cell = sizePx / (n + quiet * 2);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(x, y, sizePx, sizePx);
+  ctx.fillStyle = '#0f172a';
+  for (let r = 0; r < n; r += 1) {
+    for (let c = 0; c < n; c += 1) {
+      if (matrix[r][c]) {
+        ctx.fillRect(
+          Math.floor(x + (c + quiet) * cell),
+          Math.floor(y + (r + quiet) * cell),
+          Math.ceil(cell),
+          Math.ceil(cell)
+        );
+      }
+    }
+  }
+}
+
+function VietQrCanvas({ amount, addInfo, size = 220 }) {
+  const canvasRef = useRef(null);
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ratio = Math.max(2, window.devicePixelRatio || 1);
+    canvas.width = size * ratio;
+    canvas.height = size * ratio;
+    const ctx = canvas.getContext('2d');
+    try {
+      const matrix = encodeQrMatrix(buildVietQrPayload({ amount, addInfo }));
+      drawQrOnContext(ctx, matrix, 0, 0, size * ratio);
+    } catch (err) {
+      console.error('QR error', err);
+    }
+  }, [amount, addInfo, size]);
+  return (
+    <canvas
+      ref={canvasRef}
+      style={{ width: size, height: size, imageRendering: 'pixelated' }}
+      className="rounded-xl border border-slate-200 bg-white"
+    />
+  );
+}
+
+function wrapCanvasText(ctx, text, maxWidth) {
+  const words = String(text || '').split(' ');
+  const lines = [];
+  let line = '';
+  words.forEach((w) => {
+    const test = line ? `${line} ${w}` : w;
+    if (ctx.measureText(test).width > maxWidth && line) {
+      lines.push(line);
+      line = w;
+    } else {
+      line = test;
+    }
+  });
+  if (line) lines.push(line);
+  return lines;
+}
+
+function roundRectPath(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+// Render tuition receipt to a high-resolution canvas (PNG for Zalo)
+function renderTuitionReceiptCanvas(receipt) {
+  const SCALE = 3;
+  const W = 720;
+  const font = '"Segoe UI", Roboto, Arial, sans-serif';
+  const measure = document.createElement('canvas').getContext('2d');
+  measure.font = `15px ${font}`;
+  const presentText = receipt.sessionRows
+    .filter((s) => s.present)
+    .map((s) => `${formatSessionDate(s.date)}${s.kind === 'makeup' ? ' (bù)' : ''}`)
+    .join(', ');
+  const absentText = receipt.sessionRows
+    .filter((s) => !s.present)
+    .map((s) => formatSessionDate(s.date))
+    .join(', ');
+  const presentLines = wrapCanvasText(measure, presentText || 'Chưa có buổi học', W - 96);
+  const absentLines = absentText ? wrapCanvasText(measure, absentText, W - 96) : [];
+  const showQr = !receipt.paid && receipt.amount > 0;
+  const H =
+    330 + presentLines.length * 22 + (absentLines.length ? 34 + absentLines.length * 22 : 0) + 150 + (showQr ? 330 : 90) + 70;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = W * SCALE;
+  canvas.height = H * SCALE;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(SCALE, SCALE);
+  ctx.textBaseline = 'alphabetic';
+
+  ctx.fillStyle = '#fff1f6';
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#ffffff';
+  roundRectPath(ctx, 16, 16, W - 32, H - 32, 24);
+  ctx.fill();
+  ctx.strokeStyle = '#fbcfe8';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  const grad = ctx.createLinearGradient(16, 16, W - 16, 16);
+  grad.addColorStop(0, '#ec4899');
+  grad.addColorStop(1, '#f43f5e');
+  ctx.fillStyle = grad;
+  roundRectPath(ctx, 16, 16, W - 32, 112, 24);
+  ctx.fill();
+  ctx.fillRect(16, 100, W - 32, 28);
+
+  ctx.fillStyle = '#ffffff';
+  ctx.font = `bold 30px ${font}`;
+  ctx.fillText('LỚP CÔ HÀ', 48, 66);
+  ctx.font = `600 17px ${font}`;
+  ctx.fillText(`PHIẾU BÁO HỌC PHÍ THÁNG ${formatYmLabel(receipt.ym)}`, 48, 98);
+
+  let y = 170;
+  const label = (k, v, yy) => {
+    ctx.font = `15px ${font}`;
+    ctx.fillStyle = '#64748b';
+    ctx.fillText(k, 48, yy);
+    ctx.font = `bold 16px ${font}`;
+    ctx.fillStyle = '#0f172a';
+    ctx.fillText(v, 200, yy);
+  };
+  label('Học sinh', receipt.studentName, y);
+  y += 30;
+  label('Mã học sinh', receipt.studentCode, y);
+  y += 30;
+  label('Lớp', receipt.className, y);
+  y += 30;
+  label('Lịch học', receipt.scheduleText || '—', y);
+  y += 40;
+
+  ctx.font = `bold 15px ${font}`;
+  ctx.fillStyle = '#be185d';
+  ctx.fillText(`Các buổi có mặt (${receipt.presentCount} buổi):`, 48, y);
+  y += 24;
+  ctx.font = `15px ${font}`;
+  ctx.fillStyle = '#334155';
+  presentLines.forEach((ln) => {
+    ctx.fillText(ln, 48, y);
+    y += 22;
+  });
+  if (absentLines.length) {
+    y += 12;
+    ctx.font = `bold 15px ${font}`;
+    ctx.fillStyle = '#b45309';
+    ctx.fillText(`Buổi vắng (${receipt.absentCount} buổi — không tính phí):`, 48, y);
+    y += 24;
+    ctx.font = `15px ${font}`;
+    ctx.fillStyle = '#334155';
+    absentLines.forEach((ln) => {
+      ctx.fillText(ln, 48, y);
+      y += 22;
+    });
+  }
+
+  y += 16;
+  ctx.fillStyle = '#fdf2f8';
+  roundRectPath(ctx, 40, y, W - 80, 120, 16);
+  ctx.fill();
+  ctx.font = `15px ${font}`;
+  ctx.fillStyle = '#475569';
+  ctx.fillText(
+    `${receipt.presentCount} buổi × ${formatVnd(receipt.unitPrice)}${receipt.isCustomPrice ? ' (đơn giá riêng)' : ''}`,
+    60,
+    y + 34
+  );
+  ctx.font = `bold 15px ${font}`;
+  ctx.fillText('TỔNG HỌC PHÍ', 60, y + 90);
+  ctx.font = `bold 34px ${font}`;
+  ctx.fillStyle = '#db2777';
+  ctx.textAlign = 'right';
+  ctx.fillText(formatVnd(receipt.amount), W - 60, y + 94);
+  ctx.textAlign = 'left';
+
+  y += 140;
+  if (receipt.paid) {
+    ctx.fillStyle = '#ecfdf5';
+    roundRectPath(ctx, 40, y, W - 80, 64, 16);
+    ctx.fill();
+    ctx.fillStyle = '#047857';
+    ctx.font = `bold 20px ${font}`;
+    ctx.textAlign = 'center';
+    ctx.fillText(
+      `✓ ĐÃ ĐÓNG HỌC PHÍ${receipt.paidAt ? ` (${new Date(receipt.paidAt).toLocaleDateString('vi-VN')})` : ''}`,
+      W / 2,
+      y + 40
+    );
+    ctx.textAlign = 'left';
+    y += 90;
+  } else if (showQr) {
+    const qrSize = 260;
+    const matrix = encodeQrMatrix(buildVietQrPayload({ amount: receipt.amount, addInfo: receipt.transferNote }));
+    ctx.strokeStyle = '#e2e8f0';
+    ctx.lineWidth = 1.5;
+    roundRectPath(ctx, 40, y, W - 80, qrSize + 40, 16);
+    ctx.stroke();
+    drawQrOnContext(ctx, matrix, 56, y + 20, qrSize);
+    const tx = 56 + qrSize + 24;
+    let ty = y + 50;
+    const info = (k, v, big) => {
+      ctx.font = `14px ${font}`;
+      ctx.fillStyle = '#64748b';
+      ctx.fillText(k, tx, ty);
+      ty += big ? 30 : 24;
+      ctx.font = `bold ${big ? 22 : 16}px ${font}`;
+      ctx.fillStyle = big ? '#db2777' : '#0f172a';
+      wrapCanvasText(ctx, v, W - tx - 56).forEach((ln) => {
+        ctx.fillText(ln, tx, ty);
+        ty += big ? 30 : 22;
+      });
+      ty += 14;
+    };
+    info('Ngân hàng', `${SC_BANK.bankName}`);
+    info('Số tài khoản', SC_BANK.accountNo, true);
+    info('Chủ tài khoản', SC_BANK.accountName);
+    info('Nội dung chuyển khoản', receipt.transferNote);
+    y += qrSize + 60;
+  } else {
+    y += 10;
+  }
+
+  ctx.font = `italic 14px ${font}`;
+  ctx.fillStyle = '#94a3b8';
+  ctx.textAlign = 'center';
+  ctx.fillText('Quét mã bằng app ngân hàng — số tiền & nội dung đã điền sẵn. Cảm ơn quý phụ huynh!', W / 2, y + 14);
+  ctx.textAlign = 'left';
+
+  return canvas;
+}
+
+function describeSchedule(schedule) {
+  if (!schedule || Object.keys(schedule).length === 0) return '';
+  return SC_WEEKDAYS.filter((w) => Object.prototype.hasOwnProperty.call(schedule, w.key))
+    .map((w) => `${w.short}${schedule[w.key] ? ` ${schedule[w.key]}` : ''}`)
+    .join(' • ');
+}
+
+// ---------------------------------------------------------------------------
+// Score grid (Vocab weekly + Manual multi-column gradebook) — Excel-like input
+// ---------------------------------------------------------------------------
+function ScoreGridSection({
+  kind,
+  anchorId,
+  title,
+  subtitle,
+  classObj,
+  gridStudents,
+  data,
+  onUpdate,
+  allowMissing,
+  setConfirmDialog
+}) {
+  const grid = normalizeGridData(data, kind);
+  const gridKey = `${kind}-${classObj?.id || 'none'}`;
+
+  const focusCell = (colIdx, rowIdx) => {
+    const el = document.querySelector(`[data-grid="${gridKey}"][data-col="${colIdx}"][data-row="${rowIdx}"]`);
+    if (el) {
+      el.focus();
+      el.select?.();
+    }
+  };
+
+  const commitCell = (col, stuId, rawValue) => {
+    const text = String(rawValue ?? '').trim();
+    onUpdate((prev) => {
+      const g = normalizeGridData(prev, kind);
+      const colCells = { ...(g.cells[col.id] || {}) };
+      if (!text) {
+        delete colCells[stuId];
+      } else {
+        const parsed = parseScoreInput(text, col.total, allowMissing);
+        if (parsed?.missing) colCells[stuId] = { status: 'missing' };
+        else colCells[stuId] = { raw: text, status: 'graded' };
+      }
+      return { ...g, cells: { ...g.cells, [col.id]: colCells } };
+    });
+  };
+
+  const updateColumn = (colId, patch) => {
+    onUpdate((prev) => {
+      const g = normalizeGridData(prev, kind);
+      return { ...g, columns: g.columns.map((c) => (c.id === colId ? { ...c, ...patch } : c)) };
+    });
+  };
+
+  const addColumn = () => {
+    onUpdate((prev) => {
+      const g = normalizeGridData(prev, kind);
+      const nextWeek = g.columns.reduce((mx, c) => Math.max(mx, Number(c.week) || 0), 0) + 1;
+      const col = {
+        id: scUid(kind),
+        label: kind === 'vocab' ? `Tuần ${nextWeek}` : `Cột điểm ${g.columns.length + 1}`,
+        week: nextWeek,
+        total: 0,
+        date: new Date().toISOString().slice(0, 10)
+      };
+      return { ...g, columns: [...g.columns, col] };
+    });
+  };
+
+  const removeColumn = (col) => {
+    setConfirmDialog({
+      title: `Xóa cột "${col.label}"?`,
+      message: 'Toàn bộ điểm đã nhập trong cột này sẽ bị xóa và không thể hoàn tác.',
+      confirmText: 'Xóa cột',
+      onConfirm: async () => {
+        onUpdate((prev) => {
+          const g = normalizeGridData(prev, kind);
+          const nextCells = { ...g.cells };
+          delete nextCells[col.id];
+          return { columns: g.columns.filter((c) => c.id !== col.id), cells: nextCells };
+        });
+      }
+    });
+  };
+
+  const markBlankAsMissing = (col) => {
+    onUpdate((prev) => {
+      const g = normalizeGridData(prev, kind);
+      const colCells = { ...(g.cells[col.id] || {}) };
+      gridStudents.forEach((s) => {
+        if (!colCells[s.id]) colCells[s.id] = { status: 'missing' };
+      });
+      return { ...g, cells: { ...g.cells, [col.id]: colCells } };
+    });
+  };
+
+  const accentBtn = kind === 'vocab' ? 'bg-violet-600 hover:bg-violet-700' : 'bg-sky-600 hover:bg-sky-700';
+  const accentText = kind === 'vocab' ? 'text-violet-700' : 'text-sky-700';
+  const accentBorder = kind === 'vocab' ? 'border-violet-200' : 'border-sky-200';
+
+  return (
+    <div id={anchorId} className={`bg-white rounded-3xl border ${accentBorder} shadow-sm overflow-hidden scroll-mt-6`}>
+      <div className="p-4 sm:p-5 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div>
+          <h2 className={`font-bold flex items-center gap-2 ${accentText}`}>
+            {kind === 'vocab' ? <BookOpen className="w-4 h-4" /> : <ClipboardList className="w-4 h-4" />}
+            <span>{title}</span>
+            {classObj && <span className="text-slate-500 font-semibold">— {classObj.name}</span>}
+          </h2>
+          <p className="text-xs text-slate-500 mt-0.5">{subtitle}</p>
+        </div>
+        <button
+          type="button"
+          onClick={addColumn}
+          disabled={!classObj}
+          className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-white text-xs font-bold shadow-sm disabled:opacity-50 ${accentBtn}`}
+        >
+          <Plus className="w-3.5 h-3.5" />
+          <span>{kind === 'vocab' ? 'Thêm tuần Vocab' : 'Thêm cột điểm'}</span>
+        </button>
+      </div>
+
+      {!classObj ? (
+        <div className="p-6 text-sm text-slate-400 text-center">Anh chọn một lớp để nhập điểm.</div>
+      ) : grid.columns.length === 0 ? (
+        <div className="p-6 text-sm text-slate-400 text-center">
+          Chưa có cột nào — bấm “{kind === 'vocab' ? '+ Thêm tuần Vocab' : '+ Thêm cột điểm'}” để bắt đầu.
+        </div>
+      ) : gridStudents.length === 0 ? (
+        <div className="p-6 text-sm text-slate-400 text-center">Lớp này chưa có học sinh đang học.</div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="text-left border-collapse min-w-full">
+            <thead>
+              <tr className="bg-slate-50 border-b border-slate-200 text-xs text-slate-600">
+                <th className="py-2 px-3 sticky left-0 bg-slate-50 z-10 min-w-[180px] font-semibold">Học sinh</th>
+                {grid.columns.map((col) => (
+                  <th key={col.id} className="py-2 px-2 align-top min-w-[132px] border-l border-slate-200">
+                    <div className="flex items-start gap-1">
+                      <input
+                        key={`lbl-${col.id}-${col.label}`}
+                        defaultValue={col.label}
+                        onBlur={(e) => {
+                          const v = e.target.value.trim();
+                          if (v && v !== col.label) updateColumn(col.id, { label: v });
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') e.currentTarget.blur();
+                        }}
+                        title="Bấm để đổi tên cột"
+                        className="w-full px-1.5 py-1 text-xs font-bold text-slate-900 bg-white border border-transparent hover:border-slate-300 focus:border-pink-400 rounded-md outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => removeColumn(col)}
+                        title="Xóa cột"
+                        className="p-1 text-slate-300 hover:text-rose-600 shrink-0"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    </div>
+                    <div className="flex items-center gap-1 mt-1 text-[10px] font-medium text-slate-500">
+                      <select
+                        value={col.week}
+                        onChange={(e) => updateColumn(col.id, { week: Number(e.target.value) })}
+                        title="Tuần tương ứng (lên biểu đồ Tab 1)"
+                        className="px-1 py-0.5 bg-white border border-slate-200 rounded"
+                      >
+                        {Array.from({ length: 52 }, (_, i) => i + 1).map((w) => (
+                          <option key={w} value={w}>
+                            Tuần {w}
+                          </option>
+                        ))}
+                      </select>
+                      <input
+                        key={`tot-${col.id}-${col.total}`}
+                        type="number"
+                        min="0"
+                        defaultValue={col.total || ''}
+                        placeholder="Tổng câu"
+                        title="Tổng số câu (để trống = nhập thang 10). Có tổng câu thì gõ số câu đúng, VD 18"
+                        onBlur={(e) => {
+                          const v = Math.max(0, Number(e.target.value) || 0);
+                          if (v !== col.total) updateColumn(col.id, { total: v });
+                        }}
+                        className="w-16 px-1 py-0.5 bg-white border border-slate-200 rounded"
+                      />
+                    </div>
+                    {allowMissing && (
+                      <button
+                        type="button"
+                        onClick={() => markBlankAsMissing(col)}
+                        className="mt-1 text-[10px] font-semibold text-rose-600 hover:underline"
+                      >
+                        Ô trống → Chưa nộp
+                      </button>
+                    )}
+                  </th>
+                ))}
+                <th className="py-2 px-3 border-l border-slate-200 text-center font-semibold">TB</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100 text-sm">
+              {gridStudents.map((stu, rowIdx) => {
+                let sum = 0;
+                let cnt = 0;
+                return (
+                  <tr key={stu.id} className="hover:bg-slate-50/70">
+                    <td className="py-1.5 px-3 sticky left-0 bg-white z-10">
+                      <div className="font-semibold text-slate-900 text-xs">{stu.full_name}</div>
+                      <div className="font-mono text-[10px] text-pink-600">{stu.student_code}</div>
+                    </td>
+                    {grid.columns.map((col, colIdx) => {
+                      const cell = grid.cells[col.id]?.[stu.id];
+                      const resolved = resolveGridCell(cell, col, allowMissing);
+                      if (resolved.status !== 'blank') {
+                        sum += resolved.value;
+                        cnt += 1;
+                      }
+                      const rawShown = resolved.status === 'missing' ? 'CN' : cell?.raw || '';
+                      const showConverted =
+                        resolved.status === 'graded' && String(cell?.raw || '').trim() !== String(resolved.value);
+                      return (
+                        <td key={col.id} className="py-1 px-2 border-l border-slate-100">
+                          <div className="relative">
+                            <input
+                              key={`${col.id}-${stu.id}-${rawShown}`}
+                              defaultValue={rawShown}
+                              data-grid={gridKey}
+                              data-col={colIdx}
+                              data-row={rowIdx}
+                              onFocus={(e) => e.target.select()}
+                              onBlur={(e) => {
+                                const v = e.target.value.trim();
+                                if (v === rawShown) return;
+                                commitCell(col, stu.id, v);
+                              }}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                  e.preventDefault();
+                                  if (rowIdx + 1 < gridStudents.length) focusCell(colIdx, rowIdx + 1);
+                                  else e.currentTarget.blur();
+                                } else if (e.key === 'ArrowDown') {
+                                  e.preventDefault();
+                                  focusCell(colIdx, rowIdx + 1);
+                                } else if (e.key === 'ArrowUp') {
+                                  e.preventDefault();
+                                  focusCell(colIdx, rowIdx - 1);
+                                }
+                              }}
+                              placeholder="—"
+                              className={`w-full px-2 py-1.5 text-xs font-semibold rounded-lg border outline-none focus:ring-2 focus:ring-pink-300 ${
+                                resolved.status === 'missing'
+                                  ? 'bg-rose-50 border-rose-200 text-rose-700'
+                                  : resolved.status === 'graded'
+                                  ? 'bg-emerald-50/60 border-emerald-200 text-slate-900'
+                                  : cell
+                                  ? 'bg-amber-50 border-amber-300 text-amber-800'
+                                  : 'bg-white border-slate-200 text-slate-900'
+                              }`}
+                            />
+                            {showConverted && (
+                              <span className="absolute right-1.5 top-1/2 -translate-y-1/2 text-[10px] font-bold text-emerald-700 pointer-events-none">
+                                ={resolved.value.toFixed(1)}
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                      );
+                    })}
+                    <td className="py-1 px-3 border-l border-slate-100 text-center text-xs font-bold text-pink-700">
+                      {cnt > 0 ? (sum / cnt).toFixed(1) : '—'}
+                    </td>
+                  </tr>
+                );
+              })}
+              <tr className="bg-slate-50 text-xs font-semibold text-slate-600">
+                <td className="py-2 px-3 sticky left-0 bg-slate-50 z-10">TB cả lớp</td>
+                {grid.columns.map((col) => {
+                  let s = 0;
+                  let c = 0;
+                  let miss = 0;
+                  gridStudents.forEach((stu) => {
+                    const r = resolveGridCell(grid.cells[col.id]?.[stu.id], col, allowMissing);
+                    if (r.status !== 'blank') {
+                      s += r.value;
+                      c += 1;
+                    }
+                    if (r.status === 'missing') miss += 1;
+                  });
+                  return (
+                    <td key={col.id} className="py-2 px-2 border-l border-slate-200">
+                      {c > 0 ? (s / c).toFixed(1) : '—'}
+                      {miss > 0 && <span className="ml-1 text-rose-600">({miss} CN)</span>}
+                    </td>
+                  );
+                })}
+                <td className="border-l border-slate-200" />
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div className="px-4 py-2.5 bg-slate-50/70 border-t border-slate-100 text-[11px] text-slate-500 leading-relaxed">
+        Gõ <strong>9.5</strong> (thang 10) hoặc <strong>18/20</strong> (tự đổi = 9.0đ). Nếu cột có “Tổng câu”, chỉ cần gõ số câu
+        đúng. <strong>Enter</strong> nhảy xuống học sinh bên dưới. Ô trống = không tính vào điểm TB
+        {allowMissing && (
+          <>
+            {' '}• Gõ <strong>CN</strong> = <span className="text-rose-600 font-semibold">Chưa nộp</span> (tính 0đ & đưa vào
+            nhắc nhở gửi Phụ huynh)
+          </>
+        )}
+        . Ô màu vàng = giá trị không hợp lệ (không được tính).
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Tab 3: Class tuition price & weekly schedule settings
+// ---------------------------------------------------------------------------
+function ClassBillingSettingsCard({ classes, classCfgMap, onUpdateClassCfg }) {
+  if (classes.length === 0) return null;
+  return (
+    <div className="bg-white p-5 rounded-3xl border border-pink-200/80 shadow-sm shadow-pink-100/40 space-y-4">
+      <div>
+        <h2 className="font-bold text-slate-900 flex items-center gap-2">
+          <Wallet className="w-4 h-4 text-pink-600" />
+          <span>Học phí & Lịch học cố định theo lớp</span>
+        </h2>
+        <p className="text-xs text-slate-500 mt-0.5">
+          Tab 4 tự sinh các buổi học trong tháng theo lịch này. Đơn giá riêng từng học sinh chỉnh ở danh sách bên dưới.
+        </p>
+      </div>
+      <div className="grid md:grid-cols-2 gap-3">
+        {classes.map((cls) => {
+          const cfg = classCfgMap[cls.id] || {};
+          const schedule = cfg.schedule || {};
+          return (
+            <div key={cls.id} className="p-3.5 rounded-2xl border border-slate-200 bg-slate-50/60 space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <div className="font-bold text-sm text-slate-900">{cls.name}</div>
+                <span className="text-[11px] text-slate-500">{cls.group_name}</span>
+              </div>
+              <label className="flex items-center gap-2 text-xs text-slate-700">
+                <span className="font-semibold whitespace-nowrap">Đơn giá chuẩn / buổi</span>
+                <input
+                  key={`price-${cls.id}-${cfg.unitPrice || 0}`}
+                  type="number"
+                  min="0"
+                  step="1000"
+                  defaultValue={cfg.unitPrice || ''}
+                  placeholder="VD 150000"
+                  onBlur={(e) => {
+                    const v = Math.max(0, Number(e.target.value) || 0);
+                    if (v !== (Number(cfg.unitPrice) || 0)) {
+                      onUpdateClassCfg(cls.id, (prev) => ({ ...prev, unitPrice: v }));
+                    }
+                  }}
+                  className="flex-1 min-w-0 px-2.5 py-1.5 border border-slate-300 rounded-lg bg-white font-semibold"
+                />
+                <span className="text-slate-400">VNĐ</span>
+              </label>
+              <div className="space-y-1.5">
+                {SC_WEEKDAYS.map((wd) => {
+                  const on = Object.prototype.hasOwnProperty.call(schedule, wd.key);
+                  return (
+                    <div key={wd.key} className="flex items-center gap-2 text-xs">
+                      <label className="inline-flex items-center gap-1.5 w-24 cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={on}
+                          onChange={(e) => {
+                            onUpdateClassCfg(cls.id, (prev) => {
+                              const next = { ...(prev.schedule || {}) };
+                              if (e.target.checked) next[wd.key] = next[wd.key] || '18:00-19:30';
+                              else delete next[wd.key];
+                              return { ...prev, schedule: next };
+                            });
+                          }}
+                          className="rounded text-pink-600"
+                        />
+                        <span className={on ? 'font-bold text-slate-900' : 'text-slate-500'}>{wd.long}</span>
+                      </label>
+                      {on && (
+                        <input
+                          key={`time-${cls.id}-${wd.key}-${schedule[wd.key]}`}
+                          defaultValue={schedule[wd.key]}
+                          placeholder="18:00-19:30"
+                          onBlur={(e) => {
+                            const v = e.target.value.trim();
+                            if (v !== schedule[wd.key]) {
+                              onUpdateClassCfg(cls.id, (prev) => ({
+                                ...prev,
+                                schedule: { ...(prev.schedule || {}), [wd.key]: v }
+                              }));
+                            }
+                          }}
+                          className="w-32 px-2 py-1 border border-slate-300 rounded-lg bg-white font-mono"
+                        />
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Receipt preview modal (PNG export + copy image for Zalo)
+// ---------------------------------------------------------------------------
+function TuitionReceiptModal({ receipt, onClose, notify }) {
+  const [dataUrl, setDataUrl] = useState('');
+  const canvasRef = useRef(null);
+
+  useEffect(() => {
+    if (!receipt) return;
+    try {
+      const canvas = renderTuitionReceiptCanvas(receipt);
+      canvasRef.current = canvas;
+      setDataUrl(canvas.toDataURL('image/png'));
+    } catch (err) {
+      notify('Lỗi tạo phiếu: ' + err.message, 'error');
+    }
+  }, [receipt, notify]);
+
+  if (!receipt) return null;
+  const fileName = `PhieuHocPhi_${stripVietnamese(receipt.studentCode || receipt.studentName).replace(/[^A-Za-z0-9-]/g, '')}_${receipt.ym}.png`;
+
+  const handleDownload = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.toBlob((blob) => {
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+    }, 'image/png');
+  };
+
+  const handleCopyImage = () => {
+    const canvas = canvasRef.current;
+    if (!canvas || !navigator.clipboard || typeof window.ClipboardItem === 'undefined') {
+      notify('Trình duyệt chưa hỗ trợ copy ảnh — anh bấm Tải PNG nhé!', 'error');
+      return;
+    }
+    canvas.toBlob(async (blob) => {
+      try {
+        await navigator.clipboard.write([new window.ClipboardItem({ 'image/png': blob })]);
+        notify('Đã copy ảnh phiếu — mở Zalo và Ctrl+V để gửi!');
+      } catch {
+        notify('Không copy được ảnh — anh bấm Tải PNG nhé!', 'error');
+      }
+    }, 'image/png');
+  };
+
+  return (
+    <div className="fixed inset-0 z-[60] bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4" onClick={onClose}>
+      <div
+        className="bg-white rounded-3xl max-w-lg w-full max-h-[92vh] overflow-hidden flex flex-col shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="p-4 border-b border-slate-200 flex items-center justify-between">
+          <div className="font-bold text-slate-900 text-sm">
+            Phiếu báo học phí — {receipt.studentName} ({formatYmLabel(receipt.ym)})
+          </div>
+          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-500">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+        <div className="flex-1 overflow-y-auto bg-slate-100 p-3">
+          {dataUrl ? (
+            <img src={dataUrl} alt="Phiếu báo học phí" className="w-full rounded-xl shadow" />
+          ) : (
+            <div className="p-10 text-center text-sm text-slate-400">Đang tạo phiếu...</div>
+          )}
+        </div>
+        <div className="p-3 border-t border-slate-200 flex flex-wrap justify-end gap-2">
+          <button
+            onClick={handleCopyImage}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold"
+          >
+            <Copy className="w-3.5 h-3.5" />
+            <span>Copy ảnh (dán Zalo)</span>
+          </button>
+          <button
+            onClick={handleDownload}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-pink-600 hover:bg-pink-700 text-white text-xs font-bold"
+          >
+            <Download className="w-3.5 h-3.5" />
+            <span>Tải phiếu .PNG</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Tab 4: Attendance & tuition
+// ---------------------------------------------------------------------------
+function AttendanceTuitionPanel({
+  classes,
+  students,
+  studentMetaMap,
+  classCfgMap,
+  attendanceMap,
+  onUpdateAttendance,
+  includeInactive,
+  defaultClassId,
+  setConfirmDialog,
+  notify,
+  onOpenReceipt
+}) {
+  const [ym, setYm] = useState(getCurrentYm());
+  const [classId, setClassId] = useState(
+    defaultClassId && defaultClassId !== 'all' ? defaultClassId : classes[0]?.id || ''
+  );
+  const [makeupDate, setMakeupDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [makeupTime, setMakeupTime] = useState('');
+
+  useEffect(() => {
+    if (!classId && classes[0]) setClassId(classes[0].id);
+  }, [classes, classId]);
+
+  const cls = classes.find((c) => c.id === classId) || null;
+  const cfg = (cls && classCfgMap[cls.id]) || {};
+  const monthData = cls ? resolveMonthData(attendanceMap[cls.id], cfg, ym) : null;
+
+  const isActive = (s) => (studentMetaMap[s.id]?.status || 'active') === 'active';
+  const roster = cls
+    ? students
+        .filter((s) => s.class_id === cls.id && (includeInactive || isActive(s)))
+        .sort((a, b) => String(a.student_code).localeCompare(String(b.student_code)))
+    : [];
+
+  // Write a month (materializing generated sessions on first edit)
+  const updateMonth = (updater) => {
+    if (!cls) return;
+    onUpdateAttendance(cls.id, (prev) => {
+      const base = resolveMonthData(prev, classCfgMap[cls.id] || {}, ym);
+      const current = { sessions: base.sessions, absent: base.absent, paid: base.paid };
+      const next = updater(current);
+      return { ...(prev || {}), months: { ...((prev && prev.months) || {}), [ym]: next } };
+    });
+  };
+
+  const togglePresent = (sessId, stuId) => {
+    updateMonth((m) => {
+      const list = new Set(m.absent[sessId] || []);
+      if (list.has(stuId)) list.delete(stuId);
+      else list.add(stuId);
+      return { ...m, absent: { ...m.absent, [sessId]: Array.from(list) } };
+    });
+  };
+
+  const setSessionAll = (sessId, present) => {
+    updateMonth((m) => ({
+      ...m,
+      absent: { ...m.absent, [sessId]: present ? [] : roster.map((s) => s.id) }
+    }));
+  };
+
+  const togglePaid = (stuId) => {
+    updateMonth((m) => {
+      const paid = { ...m.paid };
+      if (paid[stuId]) delete paid[stuId];
+      else paid[stuId] = new Date().toISOString().slice(0, 10);
+      return { ...m, paid };
+    });
+  };
+
+  const addMakeup = () => {
+    if (!makeupDate || !makeupDate.startsWith(ym)) {
+      notify(`Ngày buổi bù phải nằm trong tháng ${formatYmLabel(ym)}!`, 'error');
+      return;
+    }
+    updateMonth((m) => ({
+      ...m,
+      sessions: [...m.sessions, { id: scUid('bu'), date: makeupDate, time: makeupTime.trim(), kind: 'makeup' }]
+    }));
+    notify(`Đã thêm buổi bù ${formatSessionDate(makeupDate)}!`);
+  };
+
+  const removeSession = (sess) => {
+    setConfirmDialog({
+      title: `Xóa buổi ${formatSessionDate(sess.date)}?`,
+      message: 'Buổi này sẽ không tính học phí (dùng cho ngày nghỉ lễ / nghỉ đột xuất).',
+      confirmText: 'Xóa buổi',
+      onConfirm: async () => {
+        updateMonth((m) => {
+          const absent = { ...m.absent };
+          delete absent[sess.id];
+          return { ...m, sessions: m.sessions.filter((s) => s.id !== sess.id), absent };
+        });
+      }
+    });
+  };
+
+  const regenerateFromSchedule = () => {
+    setConfirmDialog({
+      title: 'Sinh lại buổi học theo lịch cố định?',
+      message:
+        'Các buổi thường trong tháng sẽ được sinh lại theo lịch ở Tab 3 (giữ nguyên buổi bù, điểm danh của ngày trùng và trạng thái đóng tiền).',
+      confirmText: 'Sinh lại',
+      onConfirm: async () => {
+        updateMonth((m) => {
+          const regular = generateMonthSessions((classCfgMap[cls.id] || {}).schedule || {}, ym);
+          const makeups = m.sessions.filter((s) => s.kind === 'makeup');
+          return { ...m, sessions: [...regular, ...makeups] };
+        });
+      }
+    });
+  };
+
+  const rows = monthData
+    ? roster.map((stu) => ({
+        stu,
+        t: computeStudentMonthTuition(stu, monthData, cfg, studentMetaMap[stu.id])
+      }))
+    : [];
+
+  const financeSummary = classes.map((c) => {
+    const ccfg = classCfgMap[c.id] || {};
+    const md = resolveMonthData(attendanceMap[c.id], ccfg, ym);
+    const list = students.filter((s) => s.class_id === c.id && isActive(s));
+    let expected = 0;
+    let collected = 0;
+    let paidCount = 0;
+    list.forEach((s) => {
+      const t = computeStudentMonthTuition(s, md, ccfg, studentMetaMap[s.id]);
+      expected += t.amount;
+      if (t.paid) {
+        collected += t.amount;
+        paidCount += 1;
+      }
+    });
+    return { cls: c, studentCount: list.length, sessions: md.sessions.length, expected, collected, paidCount };
+  });
+  const totals = financeSummary.reduce(
+    (acc, r) => ({
+      studentCount: acc.studentCount + r.studentCount,
+      expected: acc.expected + r.expected,
+      collected: acc.collected + r.collected,
+      paidCount: acc.paidCount + r.paidCount
+    }),
+    { studentCount: 0, expected: 0, collected: 0, paidCount: 0 }
+  );
+
+  const classTotals = rows.reduce(
+    (acc, r) => ({
+      expected: acc.expected + r.t.amount,
+      collected: acc.collected + (r.t.paid ? r.t.amount : 0)
+    }),
+    { expected: 0, collected: 0 }
+  );
+
+  return (
+    <div className="space-y-6">
+      <div className="bg-white p-4 rounded-3xl border border-pink-200/80 shadow-sm shadow-pink-100/40 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <CalendarDays className="w-5 h-5 text-pink-600" />
+          <input
+            type="month"
+            value={ym}
+            onChange={(e) => e.target.value && setYm(e.target.value)}
+            className="px-3 py-2 text-sm font-semibold bg-slate-50 border border-slate-200 rounded-xl"
+          />
+          <select
+            value={classId}
+            onChange={(e) => setClassId(e.target.value)}
+            className="px-3 py-2 text-sm font-semibold bg-slate-50 border border-slate-200 rounded-xl"
+          >
+            {classes.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+              </option>
+            ))}
+          </select>
+          {cls && (
+            <span className="text-xs text-slate-600">
+              Đơn giá chuẩn: <strong className="text-pink-700">{formatVnd(cfg.unitPrice)}</strong>/buổi • Lịch:{' '}
+              <strong>{describeSchedule(cfg.schedule) || 'Chưa cài (Tab 3)'}</strong>
+            </span>
+          )}
+        </div>
+        {cls && (
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              type="date"
+              value={makeupDate}
+              onChange={(e) => setMakeupDate(e.target.value)}
+              className="px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg"
+            />
+            <input
+              value={makeupTime}
+              onChange={(e) => setMakeupTime(e.target.value)}
+              placeholder="Giờ (tùy chọn)"
+              className="w-28 px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg"
+            />
+            <button
+              type="button"
+              onClick={addMakeup}
+              className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-pink-600 hover:bg-pink-700 text-white text-xs font-bold"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>Thêm buổi bù</span>
+            </button>
+            <button
+              type="button"
+              onClick={regenerateFromSchedule}
+              className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Sinh lại theo lịch</span>
+            </button>
+          </div>
+        )}
+      </div>
+
+      {!cls ? (
+        <div className="bg-white p-8 rounded-3xl border border-slate-200 text-center text-sm text-slate-400">
+          Chưa có lớp nào — anh tạo lớp ở Tab 3 trước nhé.
+        </div>
+      ) : (
+        <div className="bg-white rounded-3xl border border-pink-200/80 shadow-sm shadow-pink-100/40 overflow-hidden">
+          <div className="p-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 className="font-bold text-slate-900">
+                Điểm danh & Học phí {cls.name} — Tháng {formatYmLabel(ym)}
+              </h2>
+              <p className="text-xs text-slate-500">
+                {monthData.sessions.length} buổi • Mặc định tick <strong>Có mặt</strong> cho học sinh đang học — bỏ tick nếu
+                vắng. {monthData.generated && 'Lịch tháng đang sinh tự động, sẽ lưu khi anh chỉnh lần đầu.'}
+              </p>
+            </div>
+            <div className="text-xs text-slate-600">
+              Dự thu <strong className="text-slate-900">{formatVnd(classTotals.expected)}</strong> • Đã thu{' '}
+              <strong className="text-emerald-700">{formatVnd(classTotals.collected)}</strong> • Còn nợ{' '}
+              <strong className="text-rose-700">{formatVnd(classTotals.expected - classTotals.collected)}</strong>
+            </div>
+          </div>
+
+          {monthData.sessions.length === 0 ? (
+            <div className="p-8 text-center text-sm text-slate-400">
+              Tháng này chưa có buổi học nào. Anh cài lịch cố định ở Tab 3 hoặc bấm “+ Thêm buổi bù”.
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="text-left border-collapse min-w-full">
+                <thead>
+                  <tr className="bg-slate-50 border-b border-slate-200 text-[11px] text-slate-600">
+                    <th className="py-2 px-3 sticky left-0 bg-slate-50 z-10 min-w-[170px] font-semibold">Học sinh</th>
+                    {monthData.sessions.map((sess) => (
+                      <th key={sess.id} className="py-2 px-1.5 text-center border-l border-slate-200 min-w-[58px]">
+                        <div className={`font-bold ${sess.kind === 'makeup' ? 'text-violet-700' : 'text-slate-800'}`}>
+                          {formatSessionDate(sess.date)}
+                        </div>
+                        <div className="text-[10px] text-slate-400">{sess.kind === 'makeup' ? 'Buổi bù' : sess.time}</div>
+                        <div className="flex items-center justify-center gap-1 mt-0.5">
+                          <button
+                            type="button"
+                            title="Cả lớp có mặt"
+                            onClick={() => setSessionAll(sess.id, true)}
+                            className="text-emerald-600 hover:text-emerald-800"
+                          >
+                            <Check className="w-3 h-3" />
+                          </button>
+                          <button
+                            type="button"
+                            title="Xóa buổi (nghỉ)"
+                            onClick={() => removeSession(sess)}
+                            className="text-slate-300 hover:text-rose-600"
+                          >
+                            <X className="w-3 h-3" />
+                          </button>
+                        </div>
+                      </th>
+                    ))}
+                    <th className="py-2 px-2 border-l border-slate-200 text-center font-semibold">Có mặt</th>
+                    <th className="py-2 px-2 text-right font-semibold">Đơn giá</th>
+                    <th className="py-2 px-2 text-right font-semibold">Thành tiền</th>
+                    <th className="py-2 px-2 text-center font-semibold">Thanh toán</th>
+                    <th className="py-2 px-2 text-center font-semibold">Phiếu</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 text-xs">
+                  {rows.map(({ stu, t }) => (
+                    <tr key={stu.id} className="hover:bg-slate-50/70">
+                      <td className="py-1.5 px-3 sticky left-0 bg-white z-10">
+                        <div className="font-semibold text-slate-900">{stu.full_name}</div>
+                        <div className="font-mono text-[10px] text-pink-600">{stu.student_code}</div>
+                      </td>
+                      {t.sessionRows.map((sess) => (
+                        <td key={sess.id} className="py-1 px-1 text-center border-l border-slate-100">
+                          <input
+                            type="checkbox"
+                            checked={sess.present}
+                            onChange={() => togglePresent(sess.id, stu.id)}
+                            className="w-4 h-4 rounded text-emerald-600 cursor-pointer"
+                          />
+                        </td>
+                      ))}
+                      <td className="py-1 px-2 text-center font-bold border-l border-slate-100">
+                        {t.presentCount}/{t.sessionRows.length}
+                      </td>
+                      <td className="py-1 px-2 text-right whitespace-nowrap">
+                        {formatVnd(t.unitPrice)}
+                        {t.isCustomPrice && <div className="text-[10px] text-violet-600 font-semibold">giá riêng</div>}
+                      </td>
+                      <td className="py-1 px-2 text-right font-bold text-slate-900 whitespace-nowrap">{formatVnd(t.amount)}</td>
+                      <td className="py-1 px-2 text-center">
+                        <button
+                          type="button"
+                          onClick={() => togglePaid(stu.id)}
+                          className={`px-2.5 py-1 rounded-full text-[11px] font-bold border whitespace-nowrap ${
+                            t.paid
+                              ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                              : 'bg-rose-50 text-rose-700 border-rose-200'
+                          }`}
+                        >
+                          {t.paid ? '✓ Đã đóng' : 'Chưa đóng'}
+                        </button>
+                      </td>
+                      <td className="py-1 px-2 text-center">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onOpenReceipt({
+                              ym,
+                              studentName: stu.full_name,
+                              studentCode: stu.student_code,
+                              className: cls.name,
+                              scheduleText: describeSchedule(cfg.schedule),
+                              transferNote: buildTransferNote(stu, cls.name, ym),
+                              ...t
+                            })
+                          }
+                          title="Xuất phiếu báo học phí .PNG kèm VietQR"
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-pink-50 hover:bg-pink-100 text-pink-700 border border-pink-200 font-bold"
+                        >
+                          <QrCode className="w-3.5 h-3.5" />
+                          <span>PNG</span>
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="bg-white rounded-3xl border border-pink-200/80 shadow-sm shadow-pink-100/40 overflow-hidden">
+        <div className="p-4 border-b border-slate-200">
+          <h2 className="font-bold text-slate-900 flex items-center gap-2">
+            <Wallet className="w-4 h-4 text-pink-600" />
+            <span>Tổng hợp tài chính toàn bộ các lớp — Tháng {formatYmLabel(ym)}</span>
+          </h2>
+          <p className="text-xs text-slate-500">Chỉ tính học sinh đang học. Học phí = số buổi có mặt × đơn giá (ưu tiên giá riêng).</p>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-left border-collapse text-xs">
+            <thead>
+              <tr className="bg-slate-50 border-b border-slate-200 text-slate-600">
+                <th className="py-2.5 px-4 font-semibold">Lớp</th>
+                <th className="py-2.5 px-4 font-semibold text-center">Sĩ số</th>
+                <th className="py-2.5 px-4 font-semibold text-center">Số buổi</th>
+                <th className="py-2.5 px-4 font-semibold text-right">Dự thu</th>
+                <th className="py-2.5 px-4 font-semibold text-right">Đã thu</th>
+                <th className="py-2.5 px-4 font-semibold text-right">Công nợ</th>
+                <th className="py-2.5 px-4 font-semibold text-center">Đã đóng</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {financeSummary.map((r) => (
+                <tr key={r.cls.id} className="hover:bg-slate-50/70">
+                  <td className="py-2 px-4 font-semibold text-slate-900">{r.cls.name}</td>
+                  <td className="py-2 px-4 text-center">{r.studentCount}</td>
+                  <td className="py-2 px-4 text-center">{r.sessions}</td>
+                  <td className="py-2 px-4 text-right">{formatVnd(r.expected)}</td>
+                  <td className="py-2 px-4 text-right text-emerald-700 font-semibold">{formatVnd(r.collected)}</td>
+                  <td className="py-2 px-4 text-right text-rose-700 font-semibold">{formatVnd(r.expected - r.collected)}</td>
+                  <td className="py-2 px-4 text-center">
+                    {r.paidCount}/{r.studentCount}
+                  </td>
+                </tr>
+              ))}
+              <tr className="bg-pink-50/60 font-bold text-slate-900">
+                <td className="py-2.5 px-4">TỔNG</td>
+                <td className="py-2.5 px-4 text-center">{totals.studentCount}</td>
+                <td className="py-2.5 px-4" />
+                <td className="py-2.5 px-4 text-right">{formatVnd(totals.expected)}</td>
+                <td className="py-2.5 px-4 text-right text-emerald-700">{formatVnd(totals.collected)}</td>
+                <td className="py-2.5 px-4 text-right text-rose-700">{formatVnd(totals.expected - totals.collected)}</td>
+                <td className="py-2.5 px-4 text-center">
+                  {totals.paidCount}/{totals.studentCount}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Student portal tab 3: attendance history + tuition + VietQR
+// ---------------------------------------------------------------------------
+function StudentTuitionView({ student, classObj, classCfg, attendanceData, studentMeta, notify }) {
+  const [ym, setYm] = useState(getCurrentYm());
+  const monthData = resolveMonthData(attendanceData, classCfg || {}, ym);
+  const t = computeStudentMonthTuition(student, monthData, classCfg || {}, studentMeta);
+  const className = classObj?.name || student.class_name || '';
+  const transferNote = buildTransferNote(student, className, ym);
+
+  const copyText = (text, msg) => {
+    navigator.clipboard?.writeText(text);
+    notify(msg);
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="bg-white p-5 rounded-3xl border border-pink-200/80 shadow-sm shadow-pink-100/40 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="font-bold text-slate-900 flex items-center gap-2">
+              <CalendarDays className="w-4 h-4 text-pink-600" />
+              <span>Điểm danh & Học phí tháng {formatYmLabel(ym)}</span>
+            </h2>
+            <p className="text-xs text-slate-500">
+              Lịch học: {describeSchedule(classCfg?.schedule) || 'Cô Hà chưa cập nhật lịch cố định'}
+            </p>
+          </div>
+          <input
+            type="month"
+            value={ym}
+            onChange={(e) => e.target.value && setYm(e.target.value)}
+            className="px-3 py-2 text-sm font-semibold bg-slate-50 border border-slate-200 rounded-xl"
+          />
+        </div>
+
+        {t.sessionRows.length === 0 ? (
+          <p className="text-sm text-slate-400">Tháng này chưa có buổi học nào được ghi nhận.</p>
+        ) : (
+          <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 gap-2">
+            {t.sessionRows.map((s) => (
+              <div
+                key={s.id}
+                className={`p-2 rounded-xl border text-center ${
+                  !s.present
+                    ? 'bg-amber-50 border-amber-200'
+                    : s.kind === 'makeup'
+                    ? 'bg-violet-50 border-violet-200'
+                    : 'bg-emerald-50 border-emerald-200'
+                }`}
+              >
+                <div className="text-xs font-bold text-slate-900">{formatSessionDate(s.date)}</div>
+                <div
+                  className={`text-[11px] font-semibold ${
+                    !s.present ? 'text-amber-700' : s.kind === 'makeup' ? 'text-violet-700' : 'text-emerald-700'
+                  }`}
+                >
+                  {!s.present ? 'Vắng' : s.kind === 'makeup' ? 'Buổi bù' : 'Có mặt'}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="bg-white p-5 rounded-3xl border border-pink-200/80 shadow-sm shadow-pink-100/40">
+        <div className="grid md:grid-cols-2 gap-5 items-start">
+          <div className="space-y-3">
+            <h3 className="font-bold text-slate-900 text-sm">Bảng kê học phí</h3>
+            <div className="text-sm space-y-1.5">
+              <div className="flex justify-between">
+                <span className="text-slate-500">Số buổi có mặt</span>
+                <strong>
+                  {t.presentCount}/{t.sessionRows.length} buổi
+                </strong>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-500">Đơn giá / buổi</span>
+                <strong>{formatVnd(t.unitPrice)}</strong>
+              </div>
+              <div className="flex justify-between pt-2 border-t border-slate-200">
+                <span className="font-bold text-slate-900">Tổng học phí</span>
+                <strong className="text-lg text-pink-600">{formatVnd(t.amount)}</strong>
+              </div>
+            </div>
+            <div
+              className={`px-3 py-2 rounded-xl text-sm font-bold text-center border ${
+                t.paid ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-rose-50 text-rose-700 border-rose-200'
+              }`}
+            >
+              {t.paid
+                ? `✓ Đã đóng học phí${t.paidAt ? ` (${new Date(t.paidAt).toLocaleDateString('vi-VN')})` : ''}`
+                : 'Chưa đóng học phí'}
+            </div>
+          </div>
+
+          {!t.paid && t.amount > 0 ? (
+            <div className="flex flex-col items-center gap-3 p-4 rounded-2xl bg-pink-50/60 border border-pink-200">
+              <VietQrCanvas amount={t.amount} addInfo={transferNote} size={210} />
+              <div className="text-xs text-center space-y-1 w-full">
+                <div>
+                  {SC_BANK.bankName} • <strong>{SC_BANK.accountName}</strong>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => copyText(SC_BANK.accountNo, 'Đã copy số tài khoản!')}
+                  className="font-mono text-base font-bold text-pink-700 hover:underline"
+                >
+                  {SC_BANK.accountNo} 📋
+                </button>
+                <button
+                  type="button"
+                  onClick={() => copyText(transferNote, 'Đã copy nội dung chuyển khoản!')}
+                  className="block w-full text-slate-600 hover:text-pink-700"
+                >
+                  Nội dung: <strong className="font-mono">{transferNote}</strong> 📋
+                </button>
+                <p className="text-[11px] text-slate-500">Quét mã bằng app ngân hàng — số tiền & nội dung đã điền sẵn.</p>
+              </div>
+            </div>
+          ) : (
+            <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 text-sm text-slate-500 text-center">
+              {t.paid ? 'Cảm ơn phụ huynh đã hoàn thành học phí tháng này 🌸' : 'Chưa có học phí cần đóng trong tháng này.'}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function TrendLineChart({ points, labelKey = 'label', valueKey = 'score', color = '#ec4899' }) {
   if (!points || points.length === 0) {
     return (
@@ -593,6 +2406,15 @@ export default function App() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [draftRestoredBanner, setDraftRestoredBanner] = useState(false);
   const [remainingSeconds, setRemainingSeconds] = useState(null);
+  // Class-level metadata (vocab / manual grades / tuition config / attendance) stored as announcement rows
+  const [classMeta, setClassMeta] = useState({ vocab: {}, manual: {}, classCfg: {}, attendance: {} });
+  const classMetaRef = useRef({ vocab: {}, manual: {}, classCfg: {}, attendance: {} });
+  const classMetaRowIds = useRef({});
+  const classMetaTimers = useRef({});
+  const classMetaInFlight = useRef({});
+  const [gradebookClassId, setGradebookClassId] = useState('');
+  const [receiptPreview, setReceiptPreview] = useState(null);
+
   const [dismissedAnnIds, setDismissedAnnIds] = useState(() => {
     try {
       return JSON.parse(localStorage.getItem('sc_dismissed_anns') || '[]');
@@ -649,6 +2471,29 @@ export default function App() {
           setStudentMetaAnnId(null);
           setStudentMetaMap({});
         }
+        // Parse class-level metadata rows (newest first -> keep the first row per type & class)
+        const nextMeta = { vocab: {}, manual: {}, classCfg: {}, attendance: {} };
+        annRes.data.forEach((a) => {
+          const msg = String(a.message || '');
+          Object.entries(SC_CLASS_META_TAGS).forEach(([type, tag]) => {
+            if (!a.class_id || !msg.startsWith(tag) || nextMeta[type][a.class_id]) return;
+            try {
+              nextMeta[type][a.class_id] = JSON.parse(msg.slice(tag.length)) || {};
+              classMetaRowIds.current[`${type}|${a.class_id}`] = a.id;
+            } catch {
+              // ignore corrupted metadata row
+            }
+          });
+        });
+        // Keep local edits that are still waiting to be synced
+        [...Object.keys(classMetaTimers.current), ...Object.keys(classMetaInFlight.current)].forEach((key) => {
+          const [type, clsId] = key.split('|');
+          const localData = classMetaRef.current[type]?.[clsId];
+          if (localData) nextMeta[type][clsId] = localData;
+        });
+        classMetaRef.current = nextMeta;
+        setClassMeta(nextMeta);
+
         setAnnouncements(
           annRes.data.filter((a) => !String(a.message || '').startsWith('__SC_'))
         );
@@ -681,6 +2526,105 @@ export default function App() {
     };
   }, [supabase, fetchAllData]);
 
+  // Persist one class-level metadata row (serialized per key, coalescing rapid edits)
+  const flushClassMeta = useCallback(
+    async (key) => {
+      if (!supabase) return;
+      if (classMetaInFlight.current[key]) {
+        classMetaInFlight.current[key] = 'dirty';
+        return;
+      }
+      classMetaInFlight.current[key] = true;
+      const [type, clsId] = key.split('|');
+      try {
+        do {
+          classMetaInFlight.current[key] = true;
+          const payload = `${SC_CLASS_META_TAGS[type]}${JSON.stringify(classMetaRef.current[type]?.[clsId] || {})}`;
+          const rowId = classMetaRowIds.current[key];
+          if (rowId) {
+            const { error } = await supabase.from('announcements').update({ message: payload }).eq('id', rowId);
+            if (error) throw error;
+          } else {
+            const { data, error } = await supabase
+              .from('announcements')
+              .insert([{ class_id: clsId, target_student_id: null, message: payload }])
+              .select()
+              .single();
+            if (error) throw error;
+            if (data?.id) classMetaRowIds.current[key] = data.id;
+          }
+        } while (classMetaInFlight.current[key] === 'dirty');
+      } catch (err) {
+        notify('Lỗi lưu dữ liệu lên Supabase: ' + err.message, 'error');
+      } finally {
+        delete classMetaInFlight.current[key];
+      }
+    },
+    [supabase, notify]
+  );
+
+  const updateClassMeta = useCallback(
+    (type, clsId, updater) => {
+      if (!clsId) return;
+      const key = `${type}|${clsId}`;
+      const prevData = classMetaRef.current[type]?.[clsId] || {};
+      const nextData = updater(prevData) || {};
+      const next = {
+        ...classMetaRef.current,
+        [type]: { ...classMetaRef.current[type], [clsId]: nextData }
+      };
+      classMetaRef.current = next;
+      setClassMeta(next);
+      clearTimeout(classMetaTimers.current[key]);
+      classMetaTimers.current[key] = setTimeout(() => {
+        delete classMetaTimers.current[key];
+        flushClassMeta(key);
+      }, 500);
+    },
+    [flushClassMeta]
+  );
+
+  // Save the whole student meta map (status / note / custom tuition price)
+  const persistStudentMetaMap = async (nextMap) => {
+    const payloadMsg = `__SC_STUDENT_META__:${JSON.stringify(nextMap)}`;
+    if (studentMetaAnnId) {
+      const { error } = await supabase
+        .from('announcements')
+        .update({ message: payloadMsg })
+        .eq('id', studentMetaAnnId);
+      if (error) throw error;
+    } else {
+      const { data, error } = await supabase
+        .from('announcements')
+        .insert([{ target_student_id: null, message: payloadMsg }])
+        .select()
+        .single();
+      if (error) throw error;
+      if (data?.id) setStudentMetaAnnId(data.id);
+    }
+    setStudentMetaMap(nextMap);
+  };
+
+  const handleSaveStudentCustomPrice = async (stu, rawValue) => {
+    if (!supabase) return;
+    const price = Math.max(0, Number(rawValue) || 0);
+    const current = studentMetaMap[stu.id] || { status: 'active', note: '' };
+    if ((Number(current.customPrice) || 0) === price) return;
+    const nextEntry = { ...current };
+    if (price > 0) nextEntry.customPrice = price;
+    else delete nextEntry.customPrice;
+    try {
+      await persistStudentMetaMap({ ...studentMetaMap, [stu.id]: nextEntry });
+      notify(
+        price > 0
+          ? `Đã gắn đơn giá riêng ${formatVnd(price)}/buổi cho ${stu.full_name}!`
+          : `${stu.full_name} dùng lại đơn giá chuẩn của lớp.`
+      );
+    } catch (err) {
+      notify('Lỗi lưu đơn giá riêng: ' + err.message, 'error');
+    }
+  };
+
   // Lưu trạng thái Đang học / Nghỉ học + ghi chú của học sinh
   const handleSaveStudentStatus = async (e) => {
     e.preventDefault();
@@ -688,6 +2632,7 @@ export default function App() {
     const nextMap = {
       ...studentMetaMap,
       [editingStudentStatus.id]: {
+        ...(studentMetaMap[editingStudentStatus.id] || {}),
         status: stuStatusDraft,
         note: stuNoteDraft.trim()
       }
@@ -1040,7 +2985,7 @@ export default function App() {
     e.preventDefault();
     setLoginError('');
     if (teacherPassInput.trim() !== TEACHER_PASSCODE) {
-      setLoginError('Mật khẩu giáo viên chưa đúng (Mặc định: 2026)');
+      setLoginError('Mật khẩu giáo viên chưa đúng. Vui lòng thử lại!');
       return;
     }
     setRole('teacher');
@@ -1387,6 +3332,93 @@ ${rawRubric}`;
     }
   };
 
+  // Unified grading engine: Web submissions + weekly Vocab + manual gradebook
+  const unifiedScoresByStudent = useMemo(() => {
+    const asgById = {};
+    assignments.forEach((a) => {
+      asgById[a.id] = a;
+    });
+    const subsByStudent = {};
+    submissions.forEach((sub) => {
+      if (sub.score === null || sub.score === undefined) return;
+      if (!subsByStudent[sub.student_id]) subsByStudent[sub.student_id] = [];
+      subsByStudent[sub.student_id].push(sub);
+    });
+    const avgOf = (arr) =>
+      arr.length > 0 ? Number((arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(1)) : null;
+
+    const map = {};
+    students.forEach((stu) => {
+      const items = [];
+      const missingManual = [];
+      (subsByStudent[stu.id] || []).forEach((sub) => {
+        const asg = asgById[sub.assignment_id];
+        items.push({
+          source: 'web',
+          score: Number(sub.score),
+          week: Number(asg?.week_number) || 1,
+          date: String(sub.submitted_at || '').slice(0, 10),
+          label: asg?.title || 'Bài web'
+        });
+      });
+      const vocabGrid = normalizeGridData(classMeta.vocab[stu.class_id], 'vocab');
+      vocabGrid.columns.forEach((col) => {
+        const r = resolveGridCell(vocabGrid.cells[col.id]?.[stu.id], col, false);
+        if (r.status === 'graded') {
+          items.push({ source: 'vocab', score: r.value, week: col.week, date: col.date, label: col.label });
+        }
+      });
+      const manualGrid = normalizeGridData(classMeta.manual[stu.class_id], 'manual');
+      manualGrid.columns.forEach((col) => {
+        const r = resolveGridCell(manualGrid.cells[col.id]?.[stu.id], col, true);
+        if (r.status === 'blank') return;
+        items.push({ source: 'manual', score: r.value, week: col.week, date: col.date, label: col.label });
+        if (r.status === 'missing') missingManual.push(col.label);
+      });
+      const pick = (src) => items.filter((i) => i.source === src).map((i) => i.score);
+      map[stu.id] = {
+        items,
+        avg: avgOf(items.map((i) => i.score)),
+        webAvg: avgOf(pick('web')),
+        vocabAvg: avgOf(pick('vocab')),
+        manualAvg: avgOf(pick('manual')),
+        webCount: pick('web').length,
+        vocabCount: pick('vocab').length,
+        manualCount: pick('manual').length,
+        missingManual
+      };
+    });
+    return map;
+  }, [students, submissions, assignments, classMeta]);
+
+  const formatSourceBreakdown = (u) => {
+    if (!u) return 'Web — • Vocab — • Chấm tay —';
+    const f = (v) => (v === null || v === undefined ? '—' : v.toFixed(1));
+    return `Web ${f(u.webAvg)} • Vocab ${f(u.vocabAvg)} • Chấm tay ${f(u.manualAvg)}`;
+  };
+
+  // Attendance summary of a student for a month (sessions up to today, used in parent report)
+  const getStudentAttendanceSummary = useCallback(
+    (stu, ym = getCurrentYm()) => {
+      const cfg = classMeta.classCfg[stu.class_id] || {};
+      const md = resolveMonthData(classMeta.attendance[stu.class_id], cfg, ym);
+      const today = new Date().toISOString().slice(0, 10);
+      const pastOnly = { ...md, sessions: md.sessions.filter((x) => x.date <= today) };
+      if (pastOnly.sessions.length === 0) return null;
+      const t = computeStudentMonthTuition(stu, pastOnly, cfg, studentMetaMap[stu.id]);
+      return { ym, presentCount: t.presentCount, total: t.sessionRows.length };
+    },
+    [classMeta, studentMetaMap]
+  );
+
+  const openGradebookForClass = (clsId) => {
+    if (clsId && clsId !== 'all') setGradebookClassId(clsId);
+    setTeacherTab('assignments');
+    setTimeout(() => {
+      document.getElementById('sc-vocab-grid')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 150);
+  };
+
   const studentPortalData = useMemo(() => {
     if (!currentStudent) return null;
     const mySubs = submissions.filter((s) => s.student_id === currentStudent.id);
@@ -1409,10 +3441,9 @@ ${rawRubric}`;
     });
 
     const graded = mySubs.filter((s) => s.score !== null && s.score !== undefined);
+    const unifiedMine = unifiedScoresByStudent[currentStudent.id];
     const avgScore =
-      graded.length > 0
-        ? (graded.reduce((a, b) => a + Number(b.score), 0) / graded.length).toFixed(1)
-        : '—';
+      unifiedMine && unifiedMine.avg !== null ? unifiedMine.avg.toFixed(1) : '—';
 
     const trend = [...graded].reverse().map((sub, idx) => {
       const asg = assignments.find((a) => a.id === sub.assignment_id);
@@ -1442,7 +3473,7 @@ ${rawRubric}`;
       weakTopics: Array.from(weakSet),
       myAnnouncements
     };
-  }, [currentStudent, submissions, assignments, announcements, dismissedAnnIds]);
+  }, [currentStudent, submissions, assignments, announcements, dismissedAnnIds, unifiedScoresByStudent]);
 
 
   // Mở bài làm cho học sinh (Hỗ trợ xem lại, làm lại bài luyện tập, khôi phục nháp & đồng hồ)
@@ -1785,10 +3816,10 @@ ${rawRubric}`;
   }, [filteredSubmissions]);
 
   const teacherKpis = useMemo(() => {
-    const graded = filteredSubmissions.filter((s) => s.score !== null && s.score !== undefined);
+    const allItems = trackedStudentsForStats.flatMap((stu) => unifiedScoresByStudent[stu.id]?.items || []);
     const avgScore =
-      graded.length > 0
-        ? (graded.reduce((acc, cur) => acc + Number(cur.score), 0) / graded.length).toFixed(1)
+      allItems.length > 0
+        ? (allItems.reduce((acc, cur) => acc + cur.score, 0) / allItems.length).toFixed(1)
         : '—';
     const classAssignments = assignments.filter(
       (a) => !a.is_remedial && (selectedClassId === 'all' || !a.class_id || a.class_id === selectedClassId)
@@ -1811,7 +3842,8 @@ ${rawRubric}`;
     filteredSubmissions,
     assignments,
     selectedClassId,
-    pendingReviewSubmissions
+    pendingReviewSubmissions,
+    unifiedScoresByStudent
   ]);
 
   // Phân tích phễu: Top câu sai nhiều nhất toàn lớp + Nhóm tốt / Nhóm cần kèm
@@ -1822,12 +3854,10 @@ ${rawRubric}`;
 
     const perStudentStats = trackedStudentsForStats.map((stu) => {
       const stuSubs = filteredSubmissions.filter((s) => s.student_id === stu.id);
-      const graded = stuSubs.filter((s) => s.score !== null && s.score !== undefined);
-      const avg =
-        graded.length > 0
-          ? Number((graded.reduce((a, b) => a + Number(b.score), 0) / graded.length).toFixed(1))
-          : null;
-      const missingCount = Math.max(0, classAsgs.length - stuSubs.length);
+      const avg = unifiedScoresByStudent[stu.id]?.avg ?? null;
+      const missingCount =
+        Math.max(0, classAsgs.length - stuSubs.length) +
+        (unifiedScoresByStudent[stu.id]?.missingManual.length || 0);
       return {
         student: stu,
         submittedCount: stuSubs.length,
@@ -1894,7 +3924,7 @@ ${rawRubric}`;
 
     const autoOverviewReport = [
       `📊 BÁO CÁO TỔNG QUAN TÌNH HÌNH HỌC TẬP (${classLabel.toUpperCase()})`,
-      `• Sĩ số đang theo dõi: ${trackedStudentsForStats.length} học sinh | Tỷ lệ hoàn thành bài: ${teacherKpis.submissionRate} | Điểm trung bình lớp: ${teacherKpis.avgScore}/10.`,
+      `• Sĩ số đang theo dõi: ${trackedStudentsForStats.length} học sinh | Tỷ lệ hoàn thành bài: ${teacherKpis.submissionRate} | Điểm TB tổng hợp (Web + Vocab + Chấm tay): ${teacherKpis.avgScore}/10.`,
       topPerformers.length > 0
         ? `• 🌟 Nhóm học tốt (≥ 8.0đ): ${topPerformers
             .slice(0, 5)
@@ -1934,7 +3964,8 @@ ${rawRubric}`;
     trackedStudentsForStats,
     filteredSubmissions,
     classes,
-    teacherKpis
+    teacherKpis,
+    unifiedScoresByStudent
   ]);
 
   // Phân tích chi tiết từng câu của 1 đề thi bất kỳ (Top câu nhiều học sinh sai nhất)
@@ -2007,27 +4038,32 @@ ${rawRubric}`;
   }, [analyticsAssignment, submissions]);
 
   const teacherChartPoints = useMemo(() => {
-    let targetSubs = filteredSubmissions.filter((s) => s.score !== null && s.score !== undefined);
-    if (chartStudentFilter !== 'all') {
-      targetSubs = targetSubs.filter((s) => s.student_id === chartStudentFilter);
-    }
+    const targetStudents =
+      chartStudentFilter === 'all'
+        ? trackedStudentsForStats
+        : trackedStudentsForStats.filter((s) => s.id === chartStudentFilter);
+    const items = targetStudents.flatMap((stu) => unifiedScoresByStudent[stu.id]?.items || []);
 
     const groups = {};
-    targetSubs.forEach((sub) => {
-      const asg = assignments.find((a) => a.id === sub.assignment_id);
-      const key =
-        chartTimeMode === 'week'
-          ? `Tuần ${asg?.week_number || 1}`
-          : new Date(sub.submitted_at).toLocaleDateString('vi-VN', { day: '2-digit', month: '2-digit' });
-      if (!groups[key]) groups[key] = [];
-      groups[key].push(Number(sub.score));
+    items.forEach((it) => {
+      const sortKey = chartTimeMode === 'week' ? String(it.week).padStart(3, '0') : it.date || '9999-99-99';
+      if (!groups[sortKey]) {
+        const [, mm, dd] = String(it.date || '').split('-');
+        groups[sortKey] = {
+          label: chartTimeMode === 'week' ? `Tuần ${it.week}` : dd && mm ? `${dd}/${mm}` : '—',
+          arr: []
+        };
+      }
+      groups[sortKey].arr.push(it.score);
     });
 
-    return Object.entries(groups).map(([label, arr]) => ({
-      label,
-      score: Number((arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(1))
-    }));
-  }, [filteredSubmissions, chartStudentFilter, chartTimeMode, assignments]);
+    return Object.keys(groups)
+      .sort()
+      .map((k) => ({
+        label: groups[k].label,
+        score: Number((groups[k].arr.reduce((a, b) => a + b, 0) / groups[k].arr.length).toFixed(1))
+      }));
+  }, [trackedStudentsForStats, chartStudentFilter, chartTimeMode, unifiedScoresByStudent]);
 
   // Tạo nhận xét tự động chi tiết cho từng học sinh (gửi phụ huynh)
   const buildIndividualStudentReport = useCallback(
@@ -2035,10 +4071,9 @@ ${rawRubric}`;
       const stuSubs = submissions.filter((s) => s.student_id === stu.id);
       const graded = stuSubs.filter((s) => s.score !== null && s.score !== undefined);
       const chronological = [...graded].reverse();
-      const avg =
-        graded.length > 0
-          ? (graded.reduce((a, b) => a + Number(b.score), 0) / graded.length).toFixed(1)
-          : null;
+      const unified = unifiedScoresByStudent[stu.id];
+      const avg = unified && unified.avg !== null ? unified.avg.toFixed(1) : null;
+      const attendance = getStudentAttendanceSummary(stu);
 
       const classTasks = assignments.filter(
         (a) => !a.is_remedial && (!a.class_id || a.class_id === stu.class_id)
@@ -2077,10 +4112,17 @@ ${rawRubric}`;
 
       const parentMessage = [
         `📋 BÁO CÁO TÌNH HÌNH HỌC TẬP — EM ${stu.full_name.toUpperCase()} (${stu.student_code})`,
-        `• Lớp: ${stu.class_name || 'Lớp học'} | Số bài đã nộp: ${stuSubs.length}/${classTasks.length} bài | Điểm trung bình: ${
+        `• Lớp: ${stu.class_name || 'Lớp học'} | Số bài web đã nộp: ${stuSubs.length}/${classTasks.length} bài | Điểm TB tổng hợp: ${
           avg !== null ? `${avg}/10` : 'Chưa có điểm'
         }.`,
+        unified && unified.items.length > 0 ? `• Chi tiết điểm: ${formatSourceBreakdown(unified)}.` : '',
+        attendance
+          ? `• Chuyên cần tháng ${formatYmLabel(attendance.ym)}: có mặt ${attendance.presentCount}/${attendance.total} buổi.`
+          : '',
         trajectoryText ? `• Tiến độ: ${trajectoryText}` : '',
+        unified && unified.missingManual.length > 0
+          ? `• ⚠️ Bài CHƯA NỘP (tính 0đ): ${unified.missingManual.join(', ')} — Phụ huynh nhắc em nộp bổ sung giúp cô nhé.`
+          : '',
         missingTasks.length > 0
           ? `• Bài chưa hoàn thành: ${missingTasks.map((t) => t.title).join(', ')} (Phụ huynh nhắc em hoàn thành sớm nhé).`
           : `• Chuyên cần: Em đã hoàn thành đầy đủ các bài tập được giao.`,
@@ -2104,7 +4146,7 @@ ${rawRubric}`;
         parentMessage
       };
     },
-    [submissions, assignments]
+    [submissions, assignments, unifiedScoresByStudent, getStudentAttendanceSummary]
   );
 
   const deepDiveData = useMemo(() => {
@@ -2978,7 +5020,7 @@ ${rawRubric}`;
                   <input
                     type="password"
                     required
-                    placeholder="Nhập mật khẩu (Mặc định: 2026)"
+                    placeholder="Nhập mật khẩu quản trị"
                     value={teacherPassInput}
                     onChange={(e) => setTeacherPassInput(e.target.value)}
                     className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-xl focus:ring-2 focus:ring-pink-500 outline-none"
@@ -3025,7 +5067,7 @@ ${rawRubric}`;
                     : 'text-slate-600 hover:bg-slate-100'
                 }`}
               >
-                2. Tạo đề từ Word/PDF & Phân tích
+                2. Bài tập, Vocab & Sổ điểm
               </button>
               <button
                 onClick={() => setTeacherTab('students')}
@@ -3035,7 +5077,17 @@ ${rawRubric}`;
                     : 'text-slate-600 hover:bg-slate-100'
                 }`}
               >
-                3. Cấp ID & Trạng thái HS ({students.length})
+                3. Lớp học & Học sinh ({students.length})
+              </button>
+              <button
+                onClick={() => setTeacherTab('attendance')}
+                className={`px-3.5 py-2 rounded-xl text-sm font-semibold transition ${
+                  teacherTab === 'attendance'
+                    ? 'bg-pink-600 text-white'
+                    : 'text-slate-600 hover:bg-slate-100'
+                }`}
+              >
+                4. Điểm danh & Học phí
               </button>
             </div>
 
@@ -3087,6 +5139,14 @@ ${rawRubric}`;
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => openGradebookForClass(selectedClassId)}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-violet-600 hover:bg-violet-700 text-white text-xs font-semibold shadow-sm"
+                    >
+                      <BookOpen className="w-3.5 h-3.5" />
+                      <span>Nhập điểm Vocab / Sổ điểm</span>
+                    </button>
                     <button
                       type="button"
                       onClick={handleRemindAllUnsubmitted}
@@ -3165,7 +5225,7 @@ ${rawRubric}`;
                     <TrendingUp className="w-4 h-4 text-pink-600" />
                   </div>
                   <div className="text-2xl font-bold text-pink-600">{teacherKpis.avgScore}</div>
-                  <div className="text-xs text-slate-400 mt-1">Thang điểm 10</div>
+                  <div className="text-xs text-slate-400 mt-1">Gộp Web + Vocab + Chấm tay (thang 10)</div>
                 </div>
 
                 <div className="bg-white p-4 rounded-3xl border border-pink-200/80 shadow-sm shadow-pink-100/40">
@@ -3306,7 +5366,7 @@ ${rawRubric}`;
                   <div>
                     <h2 className="font-bold text-slate-900">Biểu đồ điểm kết quả học tập theo thời gian</h2>
                     <p className="text-xs text-slate-500">
-                      Tự động nhảy số ngay khi học sinh nộp bài hoặc giáo viên chấm xong
+                      Gộp 3 nguồn: Bài web + Vocab hàng tuần + Sổ điểm chấm tay (theo tuần đã gán cho từng cột)
                     </p>
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
@@ -3365,7 +5425,7 @@ ${rawRubric}`;
                         <th className="py-3 px-4">Họ và tên</th>
                         <th className="py-3 px-4">Trạng thái</th>
                         <th className="py-3 px-4">Đã nộp</th>
-                        <th className="py-3 px-4">Điểm TB</th>
+                        <th className="py-3 px-4">Điểm TB (Web • Vocab • Chấm tay)</th>
                         <th className="py-3 px-4">Phần đang yếu</th>
                         <th className="py-3 px-4 text-right">Thao tác</th>
                       </tr>
@@ -3373,11 +5433,8 @@ ${rawRubric}`;
                     <tbody className="divide-y divide-slate-100 text-sm">
                       {classStudentsAll.map((stu) => {
                         const mySubs = submissions.filter((s) => s.student_id === stu.id);
-                        const graded = mySubs.filter((s) => s.score !== null && s.score !== undefined);
-                        const avg =
-                          graded.length > 0
-                            ? (graded.reduce((a, b) => a + Number(b.score), 0) / graded.length).toFixed(1)
-                            : '—';
+                        const unified = unifiedScoresByStudent[stu.id];
+                        const avg = unified && unified.avg !== null ? unified.avg.toFixed(1) : '—';
                         const weakSet = new Set();
                         mySubs.forEach((s) => (s.weak_topics || []).forEach((w) => weakSet.add(w)));
                         const weakArr = Array.from(weakSet);
@@ -3440,6 +5497,14 @@ ${rawRubric}`;
                               >
                                 {avg}
                               </span>
+                              <div className="text-[10px] text-slate-500 mt-1 whitespace-nowrap">
+                                {formatSourceBreakdown(unified)}
+                              </div>
+                              {unified && unified.missingManual.length > 0 && (
+                                <div className="text-[10px] font-semibold text-rose-600 mt-0.5">
+                                  Chưa nộp: {unified.missingManual.length} bài
+                                </div>
+                              )}
                             </td>
                             <td className="py-3 px-4">
                               {weakArr.length > 0 ? (
@@ -4105,6 +6170,102 @@ ${rawRubric}`;
             </div>
           )}
 
+          {/* TAB 2 (tiếp): SỔ ĐIỂM VOCAB HÀNG TUẦN & SỔ ĐIỂM CHẤM TAY ĐA CỘT */}
+          {teacherTab === 'assignments' &&
+            (() => {
+              const gbClassId =
+                gradebookClassId || (selectedClassId !== 'all' ? selectedClassId : classes[0]?.id || '');
+              const gbClass = classes.find((c) => c.id === gbClassId) || null;
+              const gbStudents = gbClass
+                ? students
+                    .filter(
+                      (s) =>
+                        s.class_id === gbClass.id &&
+                        (includeInactiveInStats || (studentMetaMap[s.id]?.status || 'active') === 'active')
+                    )
+                    .sort((a, b) => String(a.student_code).localeCompare(String(b.student_code)))
+                : [];
+              return (
+                <div className="space-y-6">
+                  <div
+                    id="sc-vocab-grid"
+                    className="scroll-mt-6 bg-gradient-to-r from-violet-50 via-white to-sky-50 p-4 rounded-3xl border border-violet-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                  >
+                    <div>
+                      <h2 className="font-bold text-slate-900">📒 Sổ điểm lớp: Vocab hàng tuần & Chấm tay</h2>
+                      <p className="text-xs text-slate-500">
+                        Điểm nhập ở đây tự động gộp vào Điểm TB, biểu đồ và tin nhắn báo cáo Phụ huynh ở Tab 1.
+                      </p>
+                    </div>
+                    <select
+                      value={gbClassId}
+                      onChange={(e) => setGradebookClassId(e.target.value)}
+                      className="px-3 py-2 text-sm font-semibold bg-white border border-slate-200 rounded-xl"
+                    >
+                      {classes.length === 0 && <option value="">Chưa có lớp</option>}
+                      {classes.map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <ScoreGridSection
+                    kind="vocab"
+                    anchorId="sc-vocab-table"
+                    title="Điểm Từ vựng (Vocab) hàng tuần"
+                    subtitle="Mỗi cột là một tuần — đổi tên cột trực tiếp trên tiêu đề."
+                    classObj={gbClass}
+                    gridStudents={gbStudents}
+                    data={gbClass ? classMeta.vocab[gbClass.id] : null}
+                    onUpdate={(updater) => gbClass && updateClassMeta('vocab', gbClass.id, updater)}
+                    allowMissing={false}
+                    setConfirmDialog={setConfirmDialog}
+                  />
+
+                  <ScoreGridSection
+                    kind="manual"
+                    anchorId="sc-manual-grid"
+                    title="Sổ điểm chấm tay đa cột"
+                    subtitle="VD: KT 15p Unit 1, Phiếu đọc hiểu số 2... Chọn tuần để điểm lên biểu đồ Tab 1."
+                    classObj={gbClass}
+                    gridStudents={gbStudents}
+                    data={gbClass ? classMeta.manual[gbClass.id] : null}
+                    onUpdate={(updater) => gbClass && updateClassMeta('manual', gbClass.id, updater)}
+                    allowMissing
+                    setConfirmDialog={setConfirmDialog}
+                  />
+                </div>
+              );
+            })()}
+
+          {/* TAB 4: ĐIỂM DANH & HỌC PHÍ + XUẤT PHIẾU VIETQR */}
+          {teacherTab === 'attendance' && (
+            <AttendanceTuitionPanel
+              classes={classes}
+              students={students}
+              studentMetaMap={studentMetaMap}
+              classCfgMap={classMeta.classCfg}
+              attendanceMap={classMeta.attendance}
+              onUpdateAttendance={(clsId, updater) => updateClassMeta('attendance', clsId, updater)}
+              includeInactive={includeInactiveInStats}
+              defaultClassId={selectedClassId}
+              setConfirmDialog={setConfirmDialog}
+              notify={notify}
+              onOpenReceipt={setReceiptPreview}
+            />
+          )}
+
+          {/* TAB 3: HỌC PHÍ & LỊCH HỌC CỐ ĐỊNH THEO LỚP */}
+          {teacherTab === 'students' && (
+            <ClassBillingSettingsCard
+              classes={classes}
+              classCfgMap={classMeta.classCfg}
+              onUpdateClassCfg={(clsId, updater) => updateClassMeta('classCfg', clsId, updater)}
+            />
+          )}
+
           {/* TAB 3: QUẢN LÝ ID LỚP & TRẠNG THÁI HỌC SINH */}
           {teacherTab === 'students' && (
             <div className="grid lg:grid-cols-5 gap-6">
@@ -4235,6 +6396,27 @@ ${rawRubric}`;
                           )}
                         </div>
                         <div className="flex items-center gap-2">
+                          <label
+                            className="inline-flex items-center gap-1 text-slate-600"
+                            title="Đơn giá riêng / buổi (VNĐ) — để trống = dùng đơn giá chuẩn của lớp"
+                          >
+                            <span>Giá riêng</span>
+                            <input
+                              key={`cp-${s.id}-${meta.customPrice || 0}`}
+                              type="number"
+                              min="0"
+                              step="1000"
+                              defaultValue={meta.customPrice || ''}
+                              placeholder="Chuẩn lớp"
+                              onBlur={(e) => handleSaveStudentCustomPrice(s, e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') e.currentTarget.blur();
+                              }}
+                              className={`w-24 px-2 py-1 rounded-lg border text-xs font-semibold ${
+                                meta.customPrice ? 'border-violet-300 bg-violet-50 text-violet-800' : 'border-slate-200 bg-white'
+                              }`}
+                            />
+                          </label>
                           <span className="text-slate-600">
                             PIN: <strong className="font-mono text-slate-900">{s.pin_code}</strong>
                           </span>
@@ -4277,6 +6459,11 @@ ${rawRubric}`;
             </div>
           )}
         </main>
+      )}
+
+      {/* MODAL PHIẾU BÁO HỌC PHÍ .PNG + VIETQR */}
+      {receiptPreview && (
+        <TuitionReceiptModal receipt={receiptPreview} onClose={() => setReceiptPreview(null)} notify={notify} />
       )}
 
       {/* MODAL PHÂN TÍCH ĐỀ THI & TOP CÂU SAI NHIỀU NHẤT + DANH SÁCH BÀI NỘP */}
@@ -4948,7 +7135,7 @@ ${rawRubric}`;
               </div>
             </div>
 
-            <div className="flex gap-2 shrink-0">
+            <div className="flex flex-wrap gap-2 shrink-0">
               <button
                 onClick={() => setStudentTab('tasks')}
                 className={`px-4 py-2 rounded-2xl text-xs font-bold transition ${
@@ -4968,6 +7155,16 @@ ${rawRubric}`;
                 }`}
               >
                 🌟 Phong độ & Kết quả
+              </button>
+              <button
+                onClick={() => setStudentTab('tuition')}
+                className={`px-4 py-2 rounded-2xl text-xs font-bold transition ${
+                  studentTab === 'tuition'
+                    ? 'bg-gradient-to-r from-pink-500 to-rose-500 text-white shadow-sm shadow-pink-200'
+                    : 'bg-white/90 text-pink-800 border border-pink-200 hover:bg-pink-50'
+                }`}
+              >
+                📅 Điểm danh & Học phí
               </button>
             </div>
           </div>
@@ -5032,7 +7229,16 @@ ${rawRubric}`;
             </div>
           )}
 
-          {studentTab === 'tasks' ? (
+          {studentTab === 'tuition' ? (
+            <StudentTuitionView
+              student={currentStudent}
+              classObj={classes.find((c) => c.id === currentStudent.class_id) || null}
+              classCfg={classMeta.classCfg[currentStudent.class_id] || {}}
+              attendanceData={classMeta.attendance[currentStudent.class_id]}
+              studentMeta={studentMetaMap[currentStudent.id]}
+              notify={notify}
+            />
+          ) : studentTab === 'tasks' ? (
             <div className="space-y-6">
               {studentPortalData.remedialTasks.length > 0 && (
                 <div className="space-y-3">
