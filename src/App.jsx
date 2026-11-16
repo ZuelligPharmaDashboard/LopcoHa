@@ -29,7 +29,11 @@ import {
   Timer,
   UserCheck,
   UserX,
-  Award
+  Award,
+  RotateCcw,
+  Shuffle,
+  Lock,
+  Unlock
 } from 'lucide-react';
 import {
   getSupabaseClient,
@@ -107,23 +111,71 @@ function getAssignmentQuestions(asg) {
   }));
 }
 
-// Trích xuất cấu hình bổ sung của đề (thời gian làm bài...) từ rubric
+// Trích xuất cấu hình bổ sung của đề (thời gian, loại bài, số lần làm, đảo câu...) từ rubric
 function getAssignmentMeta(asg) {
+  const defaults = {
+    timeLimitMinutes: 0,
+    assignmentType: 'homework', // 'homework' | 'practice' | 'exam'
+    maxAttempts: 1, // 0 = không giới hạn (chỉ áp dụng cho practice)
+    shuffleQuestions: false,
+    hideAnswersUntilGraded: false
+  };
   if (!asg || typeof asg.rubric !== 'string') {
-    return { timeLimitMinutes: 0 };
+    return defaults;
   }
   const match = asg.rubric.match(/__SC_META__:(\{.*?\})(?:\n|$)/);
   if (match) {
     try {
       const parsed = JSON.parse(match[1]);
+      const assignmentType = ['homework', 'practice', 'exam'].includes(parsed.assignmentType)
+        ? parsed.assignmentType
+        : 'homework';
+      const defaultMax = assignmentType === 'practice' ? 3 : 1;
+      const maxAttempts =
+        parsed.maxAttempts !== undefined && parsed.maxAttempts !== null
+          ? Math.max(0, Number(parsed.maxAttempts) || 0)
+          : defaultMax;
       return {
-        timeLimitMinutes: Number(parsed.timeLimitMinutes) || 0
+        timeLimitMinutes: Number(parsed.timeLimitMinutes) || 0,
+        assignmentType,
+        maxAttempts,
+        shuffleQuestions: Boolean(parsed.shuffleQuestions),
+        hideAnswersUntilGraded: Boolean(parsed.hideAnswersUntilGraded)
       };
     } catch {
-      return { timeLimitMinutes: 0 };
+      return defaults;
     }
   }
-  return { timeLimitMinutes: 0 };
+  return defaults;
+}
+
+// Đảo thứ tự câu hỏi theo mã học sinh (giữ nguyên số câu gốc q.number để đối chiếu đáp án & thống kê)
+function getOrderedQuestionsForStudent(questions, studentCode, assignmentId, shouldShuffle) {
+  if (!shouldShuffle || !Array.isArray(questions) || questions.length <= 1) {
+    return questions;
+  }
+  // Không đảo các câu chung một đoạn văn đọc hiểu để tránh tách rời bài đọc
+  if (questions.some((q) => Boolean(q.passage))) {
+    return questions;
+  }
+  const seedStr = `${studentCode || 'HS'}_${assignmentId || 'ASG'}`;
+  let seed = 2166136261;
+  for (let i = 0; i < seedStr.length; i += 1) {
+    seed ^= seedStr.charCodeAt(i);
+    seed = Math.imul(seed, 16777619);
+  }
+  const nextRand = () => {
+    seed += 0x6d2b79f5;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const arr = [...questions];
+  for (let i = arr.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(nextRand() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
 }
 
 function getCleanRubricText(asg) {
@@ -500,6 +552,10 @@ export default function App() {
   const [asgTopic, setAsgTopic] = useState('');
   const [asgTimePreset, setAsgTimePreset] = useState('0'); // '0' | '15' | '30' | '45' | '60' | 'custom'
   const [asgCustomMinutes, setAsgCustomMinutes] = useState('25');
+  const [asgType, setAsgType] = useState('homework'); // 'homework' | 'practice' | 'exam'
+  const [asgMaxAttempts, setAsgMaxAttempts] = useState('3'); // '2' | '3' | '5' | '0' (unlimited)
+  const [asgShuffleQuestions, setAsgShuffleQuestions] = useState(true);
+  const [asgHideAnswersOnExam, setAsgHideAnswersOnExam] = useState(false);
   const [asgAnswerKey, setAsgAnswerKey] = useState('');
   const [asgRubric, setAsgRubric] = useState('');
   const [sourceFile, setSourceFile] = useState(null);
@@ -530,6 +586,7 @@ export default function App() {
   // Cổng học sinh làm bài trực tiếp + Auto-save + Timer
   const [studentTab, setStudentTab] = useState('tasks');
   const [submittingAsg, setSubmittingAsg] = useState(null);
+  const [isRetryingPractice, setIsRetryingPractice] = useState(false);
   const [stuInteractiveAnswers, setStuInteractiveAnswers] = useState({});
   const [stuAnswerInput, setStuAnswerInput] = useState('');
   const [stuPdfFile, setStuPdfFile] = useState(null);
@@ -983,7 +1040,7 @@ export default function App() {
     e.preventDefault();
     setLoginError('');
     if (teacherPassInput.trim() !== TEACHER_PASSCODE) {
-      setLoginError('Mật khẩu giáo viên chưa đúng');
+      setLoginError('Mật khẩu giáo viên chưa đúng (Mặc định: 2026)');
       return;
     }
     setRole('teacher');
@@ -1040,7 +1097,15 @@ export default function App() {
           ? Math.max(0, Number(asgCustomMinutes) || 0)
           : Number(asgTimePreset) || 0;
 
-      const metaTag = `__SC_META__:${JSON.stringify({ timeLimitMinutes })}`;
+      const metaPayload = {
+        timeLimitMinutes,
+        assignmentType: asgType,
+        maxAttempts: asgType === 'practice' ? Math.max(0, Number(asgMaxAttempts) || 0) : 1,
+        shuffleQuestions: asgType === 'exam' ? Boolean(asgShuffleQuestions) : false,
+        hideAnswersUntilGraded: asgType === 'exam' ? Boolean(asgHideAnswersOnExam) : false
+      };
+
+      const metaTag = `__SC_META__:${JSON.stringify(metaPayload)}`;
       const embeddedRubric =
         cleanQuestions.length > 0
           ? `${asgRubric.trim()}\n${metaTag}\n__SC_QUESTIONS__:${JSON.stringify(cleanQuestions)}`
@@ -1089,12 +1154,50 @@ export default function App() {
       setSourceFile(null);
       setRawExtractedText('');
       setParsedQuestions([]);
-      notify('Đã xuất bản bài tập lên web! Học sinh có thể làm trực tiếp ngay.');
+      notify(
+        asgType === 'practice'
+          ? 'Đã đăng bài Luyện tập nhiều lần lên web!'
+          : asgType === 'exam'
+          ? 'Đã đăng đề Kiểm tra / Thi thử lên web!'
+          : 'Đã xuất bản bài tập lên web! Học sinh có thể làm trực tiếp ngay.'
+      );
       fetchAllData();
     } catch (err) {
       notify('Lỗi đăng bài: ' + err.message, 'error');
     } finally {
       setIsPublishingAsg(false);
+    }
+  };
+
+  // Mở khóa / Khóa lại đáp án chi tiết của bài kiểm tra
+  const handleToggleExamAnswerLock = async (asg) => {
+    if (!supabase || !asg) return;
+    const currentMeta = getAssignmentMeta(asg);
+    const nextMeta = {
+      ...currentMeta,
+      hideAnswersUntilGraded: !currentMeta.hideAnswersUntilGraded
+    };
+    const nextMetaTag = `__SC_META__:${JSON.stringify(nextMeta)}`;
+    const rawRubric = typeof asg.rubric === 'string' ? asg.rubric : '';
+    const updatedRubric = rawRubric.match(/__SC_META__:\{.*?\}/)
+      ? rawRubric.replace(/__SC_META__:\{.*?\}/, nextMetaTag)
+      : `${nextMetaTag}
+${rawRubric}`;
+
+    const { error } = await supabase
+      .from('assignments')
+      .update({ rubric: updatedRubric })
+      .eq('id', asg.id);
+
+    if (error) {
+      notify('Lỗi cập nhật trạng thái đáp án: ' + error.message, 'error');
+    } else {
+      notify(
+        nextMeta.hideAnswersUntilGraded
+          ? 'Đã khóa đáp án bài kiểm tra!'
+          : 'Đã mở khóa đáp án & giải thích chi tiết cho học sinh xem!'
+      );
+      fetchAllData();
     }
   };
 
@@ -1342,17 +1445,23 @@ export default function App() {
   }, [currentStudent, submissions, assignments, announcements, dismissedAnnIds]);
 
 
-  // Mở bài làm cho học sinh (Khôi phục nháp tự động + khởi động đồng hồ nếu chưa nộp)
-  const handleOpenStudentAssignment = (task) => {
+  // Mở bài làm cho học sinh (Hỗ trợ xem lại, làm lại bài luyện tập, khôi phục nháp & đồng hồ)
+  const handleOpenStudentAssignment = (task, forceRetry = false) => {
     setSubmittingAsg(task);
     setStuPdfFile(null);
     setDraftRestoredBanner(false);
 
     const existingSub = studentPortalData?.subByAsg?.[task.id];
     const meta = getAssignmentMeta(task);
+    const attemptCount = Number(existingSub?.ai_feedback_json?.attemptCount) || (existingSub ? 1 : 0);
+    const canRetryMore =
+      Boolean(existingSub) &&
+      meta.assignmentType === 'practice' &&
+      (meta.maxAttempts === 0 || attemptCount < meta.maxAttempts);
 
-    if (existingSub) {
-      // Đã nộp rồi -> khóa làm lại, mở chế độ xem kết quả & giải thích
+    if (existingSub && !(forceRetry && canRetryMore)) {
+      // Mở chế độ xem lại bài đã nộp & giải thích (có nút Làm lại bên trong nếu còn lượt)
+      setIsRetryingPractice(false);
       setStuInteractiveAnswers(
         existingSub.answers_json || existingSub.ai_feedback_json?.studentAnswersMap || {}
       );
@@ -1360,6 +1469,8 @@ export default function App() {
       setRemainingSeconds(null);
       return;
     }
+
+    setIsRetryingPractice(Boolean(existingSub && forceRetry && canRetryMore));
 
     const draftKey = `sc_draft_${currentStudent.student_code}_${task.id}`;
     try {
@@ -1392,7 +1503,7 @@ export default function App() {
   useEffect(() => {
     if (!submittingAsg || !currentStudent) return;
     const existingSub = studentPortalData?.subByAsg?.[submittingAsg.id];
-    if (existingSub) return; // Không ghi đè nếu đã nộp
+    if (existingSub && !isRetryingPractice) return; // Không ghi đè nếu đang ở chế độ xem lại
 
     const draftKey = `sc_draft_${currentStudent.student_code}_${submittingAsg.id}`;
     const hasContent =
@@ -1408,16 +1519,24 @@ export default function App() {
         })
       );
     }
-  }, [submittingAsg, currentStudent, stuInteractiveAnswers, stuAnswerInput, remainingSeconds, studentPortalData]);
+  }, [submittingAsg, currentStudent, stuInteractiveAnswers, stuAnswerInput, remainingSeconds, studentPortalData, isRetryingPractice]);
 
   // Học sinh nộp bài (hỗ trợ cả tự động thu bài khi hết giờ)
   const submitStudentWork = useCallback(
     async (isAutoTimeout = false) => {
       if (!submittingAsg || !currentStudent || !supabase || isSubmitting) return;
 
-      // Chống nộp trùng 2 lần
-      if (studentPortalData?.subByAsg?.[submittingAsg.id]) {
-        notify('Bài này em đã nộp rồi (Mỗi bài chỉ được nộp 1 lần).', 'error');
+      const existingSub = studentPortalData?.subByAsg?.[submittingAsg.id];
+      const meta = getAssignmentMeta(submittingAsg);
+      const prevAttempts = Number(existingSub?.ai_feedback_json?.attemptCount) || (existingSub ? 1 : 0);
+      const canRetryMore =
+        Boolean(existingSub) &&
+        meta.assignmentType === 'practice' &&
+        (meta.maxAttempts === 0 || prevAttempts < meta.maxAttempts);
+
+      // Chống nộp trùng nếu không phải chế độ luyện tập nhiều lần hoặc đã hết lượt
+      if (existingSub && !canRetryMore) {
+        notify('Bài này em đã nộp rồi và đã hết lượt làm bài.', 'error');
         return;
       }
 
@@ -1495,38 +1614,102 @@ export default function App() {
           }
         }
 
+        const currentAttemptNum = prevAttempts + 1;
+        const prevHistory = Array.isArray(existingSub?.ai_feedback_json?.attemptHistory)
+          ? existingSub.ai_feedback_json.attemptHistory
+          : existingSub
+          ? [
+              {
+                attempt: 1,
+                score: existingSub.score,
+                submittedAt: existingSub.submitted_at || new Date().toISOString()
+              }
+            ]
+          : [];
+
+        const nextHistory = [
+          ...prevHistory,
+          {
+            attempt: currentAttemptNum,
+            score: finalScore,
+            submittedAt: new Date().toISOString()
+          }
+        ];
+
+        // Nếu luyện tập nhiều lần: giữ điểm cao nhất làm điểm chính thức trên bảng điểm
+        const prevBestScore =
+          existingSub && existingSub.score !== null && existingSub.score !== undefined
+            ? Number(existingSub.score)
+            : null;
+        const bestScore =
+          finalScore !== null && prevBestScore !== null
+            ? Math.max(prevBestScore, Number(finalScore))
+            : finalScore !== null
+            ? finalScore
+            : prevBestScore;
+
+        const enrichedFeedbackJson = {
+          ...finalFeedbackJson,
+          attemptCount: currentAttemptNum,
+          latestScore: finalScore,
+          bestScore,
+          attemptHistory: nextHistory
+        };
+
         const fullSubPayload = {
           student_id: currentStudent.id,
           student_code: currentStudent.student_code,
           assignment_id: submittingAsg.id,
-          file_url: fileUrl,
-          file_name: fileName,
+          file_url: fileUrl || existingSub?.file_url || null,
+          file_name: fileName || existingSub?.file_name || null,
           answer_text: formattedAnswerText,
           answers_json: stuInteractiveAnswers,
           status: finalStatus,
-          score: finalScore,
+          score: bestScore,
           weak_topics: finalWeakTopics,
-          ai_feedback_json: finalFeedbackJson
+          ai_feedback_json: enrichedFeedbackJson
         };
 
-        let { error: insertErr } = await supabase.from('submissions').insert([fullSubPayload]);
-
-        if (insertErr && insertErr.message?.includes('column')) {
-          const { answers_json, ...fallbackSub } = fullSubPayload;
-          const retry = await supabase.from('submissions').insert([fallbackSub]);
-          insertErr = retry.error;
+        let insertErr = null;
+        if (existingSub) {
+          const { error: updErr } = await supabase
+            .from('submissions')
+            .update({
+              file_url: fullSubPayload.file_url,
+              file_name: fullSubPayload.file_name,
+              answer_text: fullSubPayload.answer_text,
+              answers_json: fullSubPayload.answers_json,
+              status: fullSubPayload.status,
+              score: fullSubPayload.score,
+              weak_topics: fullSubPayload.weak_topics,
+              ai_feedback_json: fullSubPayload.ai_feedback_json,
+              submitted_at: new Date().toISOString()
+            })
+            .eq('id', existingSub.id);
+          insertErr = updErr;
+        } else {
+          const res = await supabase.from('submissions').insert([fullSubPayload]);
+          insertErr = res.error;
+          if (insertErr && insertErr.message?.includes('column')) {
+            const { answers_json, ...fallbackSub } = fullSubPayload;
+            const retry = await supabase.from('submissions').insert([fallbackSub]);
+            insertErr = retry.error;
+          }
         }
 
         if (insertErr) throw insertErr;
 
-        // Xóa bản nháp sau khi nộp thành công
+        // Xóa bản nháp & thoát chế độ làm lại sau khi nộp thành công
         localStorage.removeItem(`sc_draft_${currentStudent.student_code}_${submittingAsg.id}`);
+        setIsRetryingPractice(false);
         setRemainingSeconds(null);
         setDraftRestoredBanner(false);
 
         notify(
           isAutoTimeout
             ? `Hết giờ làm bài! Hệ thống đã tự động thu bài (${finalScore !== null ? `Điểm: ${finalScore}/10` : 'Chờ GV chấm'}).`
+            : existingSub && finalScore !== null
+            ? `Hoàn thành lần ${currentAttemptNum}: Đạt ${finalScore}/10 điểm (Điểm cao nhất: ${bestScore}/10)!`
             : finalStatus === 'graded'
             ? `Chấm tự động hoàn tất! Điểm của em: ${finalScore}/10 — Xem chi tiết đáp án ngay!`
             : 'Đã nộp bài thành công! Giáo viên sẽ chấm điểm và trả kết quả ngay.'
@@ -1555,7 +1738,7 @@ export default function App() {
   // Đồng hồ đếm ngược khi học sinh đang làm bài có giới hạn thời gian
   useEffect(() => {
     if (remainingSeconds === null || !submittingAsg || !currentStudent) return;
-    if (studentPortalData?.subByAsg?.[submittingAsg.id]) return;
+    if (studentPortalData?.subByAsg?.[submittingAsg.id] && !isRetryingPractice) return;
 
     if (remainingSeconds <= 0) {
       submitStudentWork(true);
@@ -1570,7 +1753,7 @@ export default function App() {
     }, 1000);
 
     return () => clearInterval(timer);
-  }, [remainingSeconds, submittingAsg, currentStudent, studentPortalData, submitStudentWork]);
+  }, [remainingSeconds, submittingAsg, currentStudent, studentPortalData, submitStudentWork, isRetryingPractice]);
 
   // Danh sách học sinh theo lớp & trạng thái Đang học / Nghỉ học
   const classStudentsAll = useMemo(() => {
@@ -2795,7 +2978,7 @@ export default function App() {
                   <input
                     type="password"
                     required
-                    placeholder="Nhập mật khẩu"
+                    placeholder="Nhập mật khẩu (Mặc định: 2026)"
                     value={teacherPassInput}
                     onChange={(e) => setTeacherPassInput(e.target.value)}
                     className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-xl focus:ring-2 focus:ring-pink-500 outline-none"
@@ -3452,6 +3635,108 @@ export default function App() {
                   </div>
                 )}
 
+                {/* CHỌN LOẠI BÀI & CHẾ ĐỘ LUYỆN TẬP / KIỂM TRA */}
+                <div className="p-3.5 rounded-2xl bg-gradient-to-r from-pink-50/80 via-rose-50/60 to-fuchsia-50/50 border border-pink-200/80 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-bold text-slate-800">
+                      Chế độ giao bài cho học sinh
+                    </label>
+                    <span className="text-[11px] text-pink-700 font-medium">
+                      {asgType === 'homework'
+                        ? 'Làm 1 lần • Xem đáp án ngay'
+                        : asgType === 'practice'
+                        ? 'Làm lại nhiều lần • Lấy điểm cao nhất'
+                        : 'Thi nghiêm túc 1 lần • Đảo câu hỏi'}
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setAsgType('homework')}
+                      className={`p-2.5 rounded-xl border text-left transition ${
+                        asgType === 'homework'
+                          ? 'bg-white border-pink-500 ring-2 ring-pink-200 shadow-xs'
+                          : 'bg-white/70 border-slate-200 hover:bg-white'
+                      }`}
+                    >
+                      <div className="text-xs font-bold text-slate-900">📚 Bài về nhà</div>
+                      <div className="text-[10px] text-slate-500 mt-0.5">Nộp 1 lần chuẩn</div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setAsgType('practice')}
+                      className={`p-2.5 rounded-xl border text-left transition ${
+                        asgType === 'practice'
+                          ? 'bg-white border-emerald-500 ring-2 ring-emerald-200 shadow-xs'
+                          : 'bg-white/70 border-slate-200 hover:bg-white'
+                      }`}
+                    >
+                      <div className="text-xs font-bold text-emerald-800">🔄 Luyện tập</div>
+                      <div className="text-[10px] text-slate-500 mt-0.5">Cho làm nhiều lần</div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setAsgType('exam')}
+                      className={`p-2.5 rounded-xl border text-left transition ${
+                        asgType === 'exam'
+                          ? 'bg-white border-amber-500 ring-2 ring-amber-200 shadow-xs'
+                          : 'bg-white/70 border-slate-200 hover:bg-white'
+                      }`}
+                    >
+                      <div className="text-xs font-bold text-amber-800">📝 Kiểm tra</div>
+                      <div className="text-[10px] text-slate-500 mt-0.5">Đảo đề • Thi 1 lần</div>
+                    </button>
+                  </div>
+
+                  {asgType === 'practice' && (
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-pink-200/60">
+                      <span className="text-xs font-semibold text-emerald-900 flex items-center gap-1.5">
+                        <RotateCcw className="w-3.5 h-3.5 text-emerald-600" />
+                        <span>Số lần làm bài tối đa cho mỗi học sinh:</span>
+                      </span>
+                      <select
+                        value={asgMaxAttempts}
+                        onChange={(e) => setAsgMaxAttempts(e.target.value)}
+                        className="px-3 py-1.5 text-xs font-bold bg-white border border-emerald-300 rounded-lg text-emerald-900"
+                      >
+                        <option value="2">Tối đa 2 lần</option>
+                        <option value="3">Tối đa 3 lần</option>
+                        <option value="5">Tối đa 5 lần</option>
+                        <option value="0">Không giới hạn số lần</option>
+                      </select>
+                    </div>
+                  )}
+
+                  {asgType === 'exam' && (
+                    <div className="flex flex-wrap items-center gap-4 pt-2 border-t border-pink-200/60 text-xs">
+                      <label className="inline-flex items-center gap-2 font-semibold text-amber-950 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={asgShuffleQuestions}
+                          onChange={(e) => setAsgShuffleQuestions(e.target.checked)}
+                          className="rounded border-amber-400 text-pink-600 focus:ring-pink-500"
+                        />
+                        <Shuffle className="w-3.5 h-3.5 text-amber-600" />
+                        <span>Đảo thứ tự câu hỏi mỗi học sinh</span>
+                      </label>
+
+                      <label className="inline-flex items-center gap-2 font-semibold text-amber-950 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={asgHideAnswersOnExam}
+                          onChange={(e) => setAsgHideAnswersOnExam(e.target.checked)}
+                          className="rounded border-amber-400 text-pink-600 focus:ring-pink-500"
+                        />
+                        <Lock className="w-3.5 h-3.5 text-amber-600" />
+                        <span>Khóa đáp án sau khi nộp (GV mở sau)</span>
+                      </label>
+                    </div>
+                  )}
+                </div>
+
                 {/* BẢNG XEM TRƯỚC & CHỐT ĐÁP ÁN TỪNG CÂU */}
                 {parsedQuestions.length > 0 && (
                   <div className="space-y-3 border-t border-slate-200 pt-4">
@@ -3723,6 +4008,16 @@ export default function App() {
                               </span>
                             )}
                             <span className="text-xs text-slate-500">{a.class_name}</span>
+                            {meta.assignmentType === 'practice' && (
+                              <span className="px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 text-[11px] font-bold">
+                                🔄 Luyện tập ({meta.maxAttempts === 0 ? '∞ lượt' : `${meta.maxAttempts} lượt`})
+                              </span>
+                            )}
+                            {meta.assignmentType === 'exam' && (
+                              <span className="px-2 py-0.5 rounded-md bg-amber-50 text-amber-800 border border-amber-200 text-[11px] font-bold">
+                                📝 Kiểm tra{meta.shuffleQuestions ? ' • Đảo đề' : ''}
+                              </span>
+                            )}
                             {meta.timeLimitMinutes > 0 && (
                               <span className="px-2 py-0.5 rounded-md bg-amber-50 text-amber-800 text-[11px] font-bold">
                                 ⏱ {meta.timeLimitMinutes}p
@@ -3756,7 +4051,31 @@ export default function App() {
                           </span>
                         )}
 
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {meta.assignmentType === 'exam' && (
+                            <button
+                              type="button"
+                              onClick={() => handleToggleExamAnswerLock(a)}
+                              className={`inline-flex items-center gap-1 px-2 py-1 rounded-lg font-semibold border transition ${
+                                meta.hideAnswersUntilGraded
+                                  ? 'bg-amber-50 text-amber-800 border-amber-300 hover:bg-amber-100'
+                                  : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'
+                              }`}
+                              title="Bấm để mở hoặc khóa đáp án cho học sinh"
+                            >
+                              {meta.hideAnswersUntilGraded ? (
+                                <>
+                                  <Lock className="w-3 h-3" />
+                                  <span>Mở đáp án</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Unlock className="w-3 h-3" />
+                                  <span>Đang mở ĐA</span>
+                                </>
+                              )}
+                            </button>
+                          )}
                           <button
                             type="button"
                             onClick={() => setAnalyticsAssignment(a)}
@@ -4778,9 +5097,14 @@ export default function App() {
                     const sub = studentPortalData.subByAsg[task.id];
                     const qList = getAssignmentQuestions(task);
                     const meta = getAssignmentMeta(task);
+                    const attemptCount = Number(sub?.ai_feedback_json?.attemptCount) || (sub ? 1 : 0);
+                    const canRetryMore =
+                      Boolean(sub) &&
+                      meta.assignmentType === 'practice' &&
+                      (meta.maxAttempts === 0 || attemptCount < meta.maxAttempts);
                     const deadlineInfo = !sub ? getDeadlineBadgeInfo(task.due_date) : null;
                     const hasDraft =
-                      !sub &&
+                      (!sub || canRetryMore) &&
                       Boolean(
                         localStorage.getItem(`sc_draft_${currentStudent.student_code}_${task.id}`)
                       );
@@ -4792,10 +5116,20 @@ export default function App() {
                       >
                         <div>
                           <div className="flex flex-wrap items-center justify-between gap-1.5 text-xs">
-                            <div className="flex items-center gap-1.5">
+                            <div className="flex flex-wrap items-center gap-1.5">
                               <span className="px-2 py-0.5 rounded-md bg-pink-50 text-pink-700 font-bold">
                                 Tuần {task.week_number}
                               </span>
+                              {meta.assignmentType === 'practice' && (
+                                <span className="px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 font-bold">
+                                  🔄 Luyện tập ({meta.maxAttempts === 0 ? `Đã làm ${attemptCount} lần` : `${attemptCount}/${meta.maxAttempts} lượt`})
+                                </span>
+                              )}
+                              {meta.assignmentType === 'exam' && (
+                                <span className="px-2 py-0.5 rounded-md bg-amber-50 text-amber-800 border border-amber-200 font-bold">
+                                  📝 Kiểm tra
+                                </span>
+                              )}
                               {meta.timeLimitMinutes > 0 && (
                                 <span className="px-2 py-0.5 rounded-md bg-amber-50 text-amber-800 font-bold">
                                   ⏱ {meta.timeLimitMinutes} phút
@@ -4822,27 +5156,40 @@ export default function App() {
                           )}
                         </div>
 
-                        <div className="flex items-center justify-between pt-2 border-t border-slate-100">
+                        <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-100">
                           {sub ? (
                             <span className="text-xs font-bold text-emerald-600">
                               {sub.score !== null
-                                ? `Điểm: ${sub.score}/10 (Đã khóa nộp)`
+                                ? `${attemptCount > 1 ? 'Điểm cao nhất' : 'Điểm'}: ${sub.score}/10`
                                 : 'Đã nộp (Chờ giáo viên chấm)'}
                             </span>
                           ) : (
                             <span className="text-xs text-amber-600 font-medium">Chưa nộp bài</span>
                           )}
-                          <button
-                            onClick={() => handleOpenStudentAssignment(task)}
-                            className={`px-3.5 py-1.5 rounded-xl text-white text-xs font-semibold flex items-center gap-1.5 ${
-                              sub
-                                ? 'bg-emerald-600 hover:bg-emerald-700'
-                                : 'bg-pink-600 hover:bg-pink-700'
-                            }`}
-                          >
-                            <BookOpen className="w-3.5 h-3.5" />
-                            <span>{sub ? 'Xem lại bài & Đáp án' : hasDraft ? 'Làm tiếp bài' : 'Làm bài ngay'}</span>
-                          </button>
+                          <div className="flex items-center gap-1.5">
+                            {canRetryMore && (
+                              <button
+                                type="button"
+                                onClick={() => handleOpenStudentAssignment(task, true)}
+                                className="px-3 py-1.5 rounded-xl bg-pink-600 hover:bg-pink-700 text-white text-xs font-semibold flex items-center gap-1 shadow-xs"
+                              >
+                                <RotateCcw className="w-3.5 h-3.5" />
+                                <span>Làm lại (Lần {attemptCount + 1})</span>
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => handleOpenStudentAssignment(task, false)}
+                              className={`px-3.5 py-1.5 rounded-xl text-white text-xs font-semibold flex items-center gap-1.5 ${
+                                sub
+                                  ? 'bg-emerald-600 hover:bg-emerald-700'
+                                  : 'bg-pink-600 hover:bg-pink-700'
+                              }`}
+                            >
+                              <BookOpen className="w-3.5 h-3.5" />
+                              <span>{sub ? (canRetryMore ? 'Xem lại' : 'Xem lại bài & Đáp án') : hasDraft ? 'Làm tiếp bài' : 'Làm bài ngay'}</span>
+                            </button>
+                          </div>
                         </div>
                       </div>
                     );
@@ -4862,6 +5209,9 @@ export default function App() {
                 <h2 className="font-bold text-slate-900 text-sm">Chi tiết điểm, câu Đúng / Sai & Giải thích</h2>
                 {studentPortalData.mySubs.map((sub) => {
                   const asg = assignments.find((a) => a.id === sub.assignment_id);
+                  const asgMeta = getAssignmentMeta(asg);
+                  const hideAnswers =
+                    asgMeta.assignmentType === 'exam' && asgMeta.hideAnswersUntilGraded;
                   const fb = sub.ai_feedback_json || {};
                   const breakdown = Array.isArray(fb.breakdown) ? fb.breakdown : [];
 
@@ -4891,7 +5241,7 @@ export default function App() {
                         </p>
                       )}
 
-                      {breakdown.length > 0 && (
+                      {!hideAnswers && breakdown.length > 0 && (
                         <div className="space-y-1.5">
                           <div className="text-[11px] font-bold text-slate-600">
                             Kết quả chi tiết từng câu:
@@ -4925,7 +5275,7 @@ export default function App() {
                         </div>
                       )}
 
-                      {Array.isArray(fb.wrongDetails) && fb.wrongDetails.length > 0 && (
+                      {!hideAnswers && Array.isArray(fb.wrongDetails) && fb.wrongDetails.length > 0 && (
                         <div className="p-3 rounded-xl bg-rose-50 text-xs text-rose-800 space-y-1.5">
                           <div className="font-bold">Chi tiết các câu sai & Giải thích:</div>
                           {fb.wrongDetails.map((line, i) => (
@@ -4942,12 +5292,31 @@ export default function App() {
         </main>
       )}
 
-      {/* MODAL HỌC SINH LÀM BÀI (KHÓA NỘP 1 LẦN + AUTO-SAVE + TIMER + ĐỌC HIỂU + XEM ĐÁP ÁN & GIẢI THÍCH) */}
+      {/* MODAL HỌC SINH LÀM BÀI (LUYỆN TẬP NHIỀU LẦN / KIỂM TRA ĐẢO ĐỀ / AUTO-SAVE / TIMER / XEM ĐÁP ÁN) */}
       {submittingAsg && (() => {
-        const qList = getAssignmentQuestions(submittingAsg);
+        const rawQList = getAssignmentQuestions(submittingAsg);
+        const asgMeta = getAssignmentMeta(submittingAsg);
+        const qList = getOrderedQuestionsForStudent(
+          rawQList,
+          currentStudent?.student_code,
+          submittingAsg.id,
+          asgMeta.shuffleQuestions
+        );
         const cleanRubric = getCleanRubricText(submittingAsg);
         const existingSub = studentPortalData?.subByAsg?.[submittingAsg.id];
-        const isLockedReview = Boolean(existingSub);
+        const attemptCount = Number(existingSub?.ai_feedback_json?.attemptCount) || (existingSub ? 1 : 0);
+        const attemptHistory = Array.isArray(existingSub?.ai_feedback_json?.attemptHistory)
+          ? existingSub.ai_feedback_json.attemptHistory
+          : [];
+        const canRetryMore =
+          Boolean(existingSub) &&
+          asgMeta.assignmentType === 'practice' &&
+          (asgMeta.maxAttempts === 0 || attemptCount < asgMeta.maxAttempts);
+        const isLockedReview = Boolean(existingSub) && !isRetryingPractice;
+        const hideAnswers =
+          isLockedReview &&
+          asgMeta.assignmentType === 'exam' &&
+          asgMeta.hideAnswersUntilGraded;
         const breakdownMap = {};
         (existingSub?.ai_feedback_json?.breakdown || []).forEach((b) => {
           breakdownMap[String(b.question)] = b;
@@ -5013,6 +5382,7 @@ export default function App() {
                     type="button"
                     onClick={() => {
                       setSubmittingAsg(null);
+                      setIsRetryingPractice(false);
                       setRemainingSeconds(null);
                     }}
                     className="text-slate-400 hover:text-slate-600 p-1"
@@ -5023,20 +5393,71 @@ export default function App() {
               </div>
 
               {isLockedReview ? (
-                <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-900 space-y-1 shrink-0">
-                  <div className="font-bold">
-                    🔒 Bài làm đã nộp & khóa chỉnh sửa (Mỗi bài chỉ nộp 1 lần).
+                <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-900 space-y-2 shrink-0">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="font-bold">
+                      {canRetryMore
+                        ? `🔄 Chế độ luyện tập: Em đã hoàn thành ${attemptCount}/${asgMeta.maxAttempts === 0 ? '∞' : asgMeta.maxAttempts} lượt làm bài.`
+                        : '🔒 Bài làm đã nộp & khóa chỉnh sửa.'}
+                    </div>
+                    {canRetryMore && (
+                      <button
+                        type="button"
+                        onClick={() => handleOpenStudentAssignment(submittingAsg, true)}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-pink-600 hover:bg-pink-700 text-white font-bold shadow-xs"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5" />
+                        <span>Làm lại bài này (Lần {attemptCount + 1})</span>
+                      </button>
+                    )}
                   </div>
                   {existingSub.ai_feedback_json?.summary && (
                     <div>{existingSub.ai_feedback_json.summary}</div>
                   )}
+                  {attemptHistory.length > 1 && (
+                    <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-emerald-200/70">
+                      <span className="font-bold text-emerald-800">Lịch sử điểm:</span>
+                      {attemptHistory.map((h, i) => (
+                        <span
+                          key={i}
+                          className="px-2 py-0.5 rounded bg-white border border-emerald-200 font-semibold text-emerald-800"
+                        >
+                          Lần {h.attempt}: {h.score !== null && h.score !== undefined ? `${h.score}đ` : 'Chờ chấm'}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {hideAnswers && (
+                    <div className="p-2 rounded-lg bg-amber-50 border border-amber-200 text-amber-900 font-medium">
+                      ⏳ Đề kiểm tra đang khóa đáp án chi tiết. Giáo viên sẽ mở đáp án sau khi cả lớp thi xong!
+                    </div>
+                  )}
                 </div>
               ) : (
-                draftRestoredBanner && (
-                  <div className="px-3.5 py-2 rounded-xl bg-pink-50 border border-pink-200 text-xs text-pink-800 font-medium shrink-0">
-                    💾 Đã tự động khôi phục các câu em đã chọn trước đó!
-                  </div>
-                )
+                <>
+                  {isRetryingPractice && (
+                    <div className="px-3.5 py-2 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-900 font-semibold shrink-0 flex items-center justify-between">
+                      <span>🔄 Đang làm lại lượt {attemptCount + 1} — Hệ thống sẽ ghi nhận điểm cao nhất của em!</span>
+                      <button
+                        type="button"
+                        onClick={() => handleOpenStudentAssignment(submittingAsg, false)}
+                        className="underline text-emerald-700 hover:text-emerald-900 ml-2"
+                      >
+                        Quay lại xem bài cũ
+                      </button>
+                    </div>
+                  )}
+                  {asgMeta.shuffleQuestions && !isRetryingPractice && (
+                    <div className="px-3.5 py-2 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900 font-medium shrink-0">
+                      🔀 Đề kiểm tra đã được đảo thứ tự câu hỏi riêng cho em. Chúc em làm bài thật tốt!
+                    </div>
+                  )}
+                  {draftRestoredBanner && (
+                    <div className="px-3.5 py-2 rounded-xl bg-pink-50 border border-pink-200 text-xs text-pink-800 font-medium shrink-0">
+                      💾 Đã tự động khôi phục các câu em đã chọn trước đó!
+                    </div>
+                  )}
+                </>
               )}
 
               <div className="overflow-y-auto space-y-4 pr-1 flex-1">
@@ -5072,9 +5493,9 @@ export default function App() {
 
                           <div
                             className={`p-4 rounded-2xl border space-y-3 ${
-                              isLockedReview && bItem?.status === 'correct'
+                              isLockedReview && !hideAnswers && bItem?.status === 'correct'
                                 ? 'bg-emerald-50/50 border-emerald-300'
-                                : isLockedReview && bItem?.status === 'wrong'
+                                : isLockedReview && !hideAnswers && bItem?.status === 'wrong'
                                 ? 'bg-rose-50/50 border-rose-300'
                                 : 'bg-slate-50/70 border-slate-200'
                             }`}
@@ -5092,7 +5513,7 @@ export default function App() {
                                 {q.text}
                               </div>
 
-                              {isLockedReview && bItem && (
+                              {isLockedReview && !hideAnswers && bItem && (
                                 <span
                                   className={`px-2 py-0.5 rounded-md text-[11px] font-bold shrink-0 ${
                                     bItem.status === 'correct'
@@ -5120,7 +5541,11 @@ export default function App() {
                                     let btnStyle =
                                       'bg-white text-slate-800 border-slate-200 hover:border-pink-400';
                                     if (isLockedReview) {
-                                      if (isCorrectOpt) {
+                                      if (hideAnswers) {
+                                        btnStyle = active
+                                          ? 'bg-pink-600 text-white border-pink-600 shadow-sm'
+                                          : 'bg-white text-slate-500 border-slate-200 opacity-80';
+                                      } else if (isCorrectOpt) {
                                         btnStyle =
                                           'bg-emerald-600 text-white border-emerald-600 shadow-sm';
                                       } else if (active && !isCorrectOpt) {
@@ -5176,8 +5601,8 @@ export default function App() {
                               />
                             )}
 
-                            {/* HIỆN ĐÁP ÁN ĐÚNG & GIẢI THÍCH NGAY SAU KHI NỘP */}
-                            {isLockedReview && (q.correctAnswer || bItem?.expected || q.explanation || bItem?.explanation || q.previousWrongAnswer) && (
+                            {/* HIỆN ĐÁP ÁN ĐÚNG & GIẢI THÍCH NGAY SAU KHI NỘP (NẾU KHÔNG BỊ KHÓA) */}
+                            {isLockedReview && !hideAnswers && (q.correctAnswer || bItem?.expected || q.explanation || bItem?.explanation || q.previousWrongAnswer) && (
                               <div className="p-2.5 rounded-xl bg-white border border-slate-200 text-xs space-y-1">
                                 {q.previousWrongAnswer && (
                                   <div className="text-slate-500">
@@ -5248,6 +5673,7 @@ export default function App() {
                     type="button"
                     onClick={() => {
                       setSubmittingAsg(null);
+                      setIsRetryingPractice(false);
                       setRemainingSeconds(null);
                     }}
                     className="w-full py-2.5 rounded-xl bg-slate-800 hover:bg-slate-900 text-white font-semibold text-sm"
