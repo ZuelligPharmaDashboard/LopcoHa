@@ -91,6 +91,138 @@ function generateRandomPin() {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
 
+// ============================================================================
+// ANSWER-KEY NORMALIZATION (single source of truth for grading, review & stats)
+// Keys like "B (ancient). ancient = cổ đại" / "(b)" / "Đáp án: B" / option text -> "B"
+// ============================================================================
+/**
+ * Loose text normalization for comparing answers (case, spaces, punctuation)
+ */
+function normalizeLooseText(str) {
+  return String(str ?? '')
+    .normalize('NFC')
+    .toLowerCase()
+    .replace(/[\s.,;:!?'"“”‘’`()[\]{}…\-–—_]+/g, '');
+}
+
+/**
+ * Extract the MCQ letter (A-D) from a raw key such as:
+ * "B", "b)", "(B)", "B.", "B (ancient). ancient = ...", "Đáp án: B", or the option text itself ("ancient").
+ * Returns { letter, rest } — rest is any trailing explanation text.
+ */
+function extractMcqLetter(raw, options = {}) {
+  let text = String(raw ?? '').trim();
+  if (!text) return { letter: '', rest: '' };
+  text = text.replace(/^(?:đáp\s*án(?:\s*đúng)?|đa|answer|ans|key)\s*[:.\-–—]?\s*/i, '').trim();
+  if (!text) return { letter: '', rest: '' };
+
+  const optEntries = ['A', 'B', 'C', 'D']
+    .map((k) => [k, normalizeLooseText(options?.[k])])
+    .filter(([, v]) => v);
+
+  // 1. The whole key equals one option text
+  const whole = normalizeLooseText(text);
+  const exact = optEntries.filter(([, v]) => v === whole);
+  if (exact.length === 1) return { letter: exact[0][0], rest: '' };
+
+  // 2. Leading letter: "B", "B.", "B)", "(B)", "B - ...", "B (ancient)..."
+  const m = text.match(/^[([]?\s*([A-Da-d])\s*(?=$|[)\].:,;=\-–—→>]|\s|\()/);
+  if (m) {
+    const isLower = m[1] === m[1].toLowerCase();
+    const after = text.slice(m[0].length);
+    // A lowercase letter followed by a plain word ("a book") is text, not a letter key
+    const looksLikeWord = isLower && /^\s+[a-zà-ỹ]/i.test(after) && !/^\s*[)\].:]/.test(after);
+    if (!looksLikeWord) {
+      let rest = after
+        .replace(/^\s*[)\]]/, '')
+        .replace(/^\s*[.:,;=\-–—→>]+\s*/, '')
+        .trim();
+      // Drop a leading "(option text)" echo
+      const echo = rest.match(/^\(([^)]*)\)\s*[.:,;\-–—]?\s*/);
+      if (echo) {
+        const echoNorm = normalizeLooseText(echo[1]);
+        const optNorm = normalizeLooseText(options?.[m[1].toUpperCase()]);
+        if (!optNorm || echoNorm === optNorm) rest = rest.slice(echo[0].length).trim();
+      }
+      return { letter: m[1].toUpperCase(), rest };
+    }
+  }
+
+  // 3. Key starts with exactly one option's text ("ancient = cổ đại...")
+  const prefix = optEntries.filter(([, v]) => v.length >= 2 && whole.startsWith(v));
+  if (prefix.length === 1) return { letter: prefix[0][0], rest: text };
+
+  return { letter: '', rest: text };
+}
+
+
+// Accepted alternatives for open answers: "lived / had lived" or "lived | had lived"
+function splitAcceptedAnswers(expected) {
+  return String(expected ?? '')
+    .split(/\s*\|\s*/)
+    .filter(Boolean)
+    .flatMap((part) => {
+      const sub = part.split('/').map((x) => x.trim()).filter(Boolean);
+      return sub.length > 1 && sub.every((x) => /[a-zà-ỹ]/i.test(x)) ? sub : [part];
+    });
+}
+
+function hasGradableKey(q) {
+  if (!q) return false;
+  if (q.type === 'mcq') return Boolean(extractMcqLetter(q.correctAnswer, q.options).letter);
+  return String(q.correctAnswer ?? '').trim() !== '';
+}
+
+function getKeyLetterOrText(q) {
+  if (!q) return '';
+  if (q.type === 'mcq') return extractMcqLetter(q.correctAnswer, q.options).letter;
+  return String(q.correctAnswer ?? '').trim();
+}
+
+function isAnswerCorrect(q, actualRaw) {
+  const actual = String(actualRaw ?? '').trim();
+  if (!q || !actual || actual === '(Bỏ trống)') return false;
+  if (q.type === 'mcq') {
+    const key = extractMcqLetter(q.correctAnswer, q.options).letter;
+    const act = extractMcqLetter(actual, q.options).letter;
+    return Boolean(key) && key === act;
+  }
+  const expected = String(q.correctAnswer ?? '').trim();
+  if (!expected) return false;
+  const actNorm = normalizeLooseText(actual);
+  return splitAcceptedAnswers(expected).some((alt) => normalizeLooseText(alt) === actNorm);
+}
+
+function formatKeyForDisplay(q, fallback = '') {
+  if (q?.type === 'mcq') {
+    const letter = extractMcqLetter(q.correctAnswer || fallback, q.options).letter;
+    if (letter) return q.options?.[letter] ? `${letter}. ${q.options[letter]}` : letter;
+  }
+  return String(q?.correctAnswer || fallback || '').trim();
+}
+
+// Clean one question: MCQ key -> single letter, leftover text -> explanation, unreadable key -> teacher grading
+function sanitizeQuestion(q) {
+  if (!q) return q;
+  const type = q.type === 'mcq' ? 'mcq' : 'open';
+  const raw = String(q.correctAnswer ?? '').trim();
+  let correctAnswer = raw;
+  let explanation = q.explanation || '';
+  let keyIssue = q.keyIssue || '';
+  if (type === 'mcq' && raw) {
+    const { letter, rest } = extractMcqLetter(raw, q.options);
+    if (letter) {
+      correctAnswer = letter;
+      if (!explanation && rest) explanation = rest;
+    } else {
+      correctAnswer = '';
+      if (!explanation) explanation = raw;
+      keyIssue = keyIssue || `Không đọc được đáp án A–D từ "${raw.slice(0, 40)}" → chờ GV chấm tay`;
+    }
+  }
+  return { ...q, type, correctAnswer, explanation, keyIssue };
+}
+
 // Trích xuất danh sách câu hỏi từ cột questions_json hoặc chuỗi nhúng trong rubric
 function getAssignmentQuestions(asg) {
   if (!asg) return [];
@@ -107,13 +239,15 @@ function getAssignmentQuestions(asg) {
     }
   }
   // Chuẩn hóa loại câu hỏi về 2 nhóm duy nhất: 'mcq' và 'open'
-  return rawList.map((q, idx) => ({
-    ...q,
-    number: Number(q.number) || idx + 1,
-    type: q.type === 'mcq' ? 'mcq' : 'open',
-    passage: q.passage || '',
-    explanation: q.explanation || ''
-  }));
+  return rawList.map((q, idx) =>
+    sanitizeQuestion({
+      ...q,
+      number: Number(q.number) || idx + 1,
+      type: q.type === 'mcq' ? 'mcq' : 'open',
+      passage: q.passage || '',
+      explanation: q.explanation || ''
+    })
+  );
 }
 
 // Trích xuất cấu hình bổ sung của đề (thời gian, loại bài, số lần làm, đảo câu...) từ rubric
@@ -263,7 +397,7 @@ function formatSecondsMMSS(totalSec) {
 // Chấm điểm tự động 100% + tạo nhận xét chi tiết từng câu sai & giải thích
 function gradeInteractiveQuestions(questions, studentAnswersMap, topic) {
   const gradableQuestions = questions.filter(
-    (q) => q.correctAnswer && String(q.correctAnswer).trim() !== ''
+    (q) => hasGradableKey(q)
   );
 
   if (gradableQuestions.length === 0) {
@@ -277,12 +411,9 @@ function gradeInteractiveQuestions(questions, studentAnswersMap, topic) {
 
   gradableQuestions.forEach((q) => {
     const key = String(q.number);
-    const expected = String(q.correctAnswer).trim();
+    const expected = getKeyLetterOrText(q);
     const actual = String(studentAnswersMap[key] || '').trim();
-
-    const normExpected = expected.toLowerCase().replace(/\s+/g, '');
-    const normActual = actual.toLowerCase().replace(/\s+/g, '');
-    const isRight = normActual !== '' && normActual === normExpected;
+    const isRight = isAnswerCorrect(q, actual);
 
     const expText =
       q.type === 'mcq' && q.options?.[expected.toUpperCase()]
@@ -321,7 +452,7 @@ function gradeInteractiveQuestions(questions, studentAnswersMap, topic) {
   });
 
   const hasUngradedOpen = questions.some(
-    (q) => !q.correctAnswer || String(q.correctAnswer).trim() === ''
+    (q) => !hasGradableKey(q)
   );
 
   const score = Number(((correctCount / gradableQuestions.length) * 10).toFixed(2));
@@ -361,10 +492,14 @@ function autoGradeLegacyTextAnswers(answerKeyRaw, studentAnswerRaw, topic) {
       .filter(Boolean);
     parts.forEach((part, idx) => {
       const match = part.match(/^(?:câu\s*)?([^:=\-]+)[:=\-]\s*(.+)$/i);
+      const toValue = (v) => {
+        const letter = extractMcqLetter(v).letter;
+        return (letter || v).toLowerCase();
+      };
       if (match) {
-        map[match[1].trim().toLowerCase()] = match[2].trim().toLowerCase();
+        map[match[1].trim().toLowerCase()] = toValue(match[2].trim());
       } else {
-        map[String(idx + 1)] = part.toLowerCase();
+        map[String(idx + 1)] = toValue(part);
       }
     });
     return map;
@@ -2199,6 +2334,22 @@ function StudentTuitionView({ student, classObj, classCfg, attendanceData, stude
   );
 }
 
+// Re-grade one submission with the assignment's CURRENT key (uses saved student answers)
+function regradeSubmission(sub, asg) {
+  if (!sub || !asg) return null;
+  const qList = getAssignmentQuestions(asg);
+  const fb = sub.ai_feedback_json || {};
+  if (qList.length > 0) {
+    const ansMap = sub.answers_json || fb.studentAnswersMap || null;
+    if (!ansMap) return null;
+    return gradeInteractiveQuestions(qList, ansMap, asg.topic);
+  }
+  if (asg.answer_key_text && sub.answer_text && !sub.file_url) {
+    return autoGradeLegacyTextAnswers(asg.answer_key_text, sub.answer_text, asg.topic);
+  }
+  return null;
+}
+
 function TrendLineChart({ points, labelKey = 'label', valueKey = 'score', color = '#ec4899' }) {
   if (!points || points.length === 0) {
     return (
@@ -2400,6 +2551,8 @@ export default function App() {
   const [studentTab, setStudentTab] = useState('tasks');
   const [submittingAsg, setSubmittingAsg] = useState(null);
   const [isRetryingPractice, setIsRetryingPractice] = useState(false);
+  const [showSubmitConfirm, setShowSubmitConfirm] = useState(false);
+  const [reviewWrongOnly, setReviewWrongOnly] = useState(false);
   const [stuInteractiveAnswers, setStuInteractiveAnswers] = useState({});
   const [stuAnswerInput, setStuAnswerInput] = useState('');
   const [stuPdfFile, setStuPdfFile] = useState(null);
@@ -2679,11 +2832,70 @@ export default function App() {
     });
   };
 
+  // Re-grade submissions with the current key (fixes scores graded with a badly-read key)
+  const applyRegrade = async (items) => {
+    if (!supabase || items.length === 0) return;
+    let ok = 0;
+    let failed = 0;
+    for (const { sub, asg } of items) {
+      const g = regradeSubmission(sub, asg);
+      if (!g) continue;
+      const fb = sub.ai_feedback_json || {};
+      const history =
+        Array.isArray(fb.attemptHistory) && fb.attemptHistory.length > 0
+          ? fb.attemptHistory.map((h, i, arr) => (i === arr.length - 1 ? { ...h, score: g.score } : h))
+          : fb.attemptHistory;
+      const nextFb = {
+        ...fb,
+        ...g.feedbackJson,
+        attemptHistory: history,
+        latestScore: g.score,
+        bestScore: g.score,
+        regradedAt: new Date().toISOString()
+      };
+      if (fb.studentAnswersMap) nextFb.studentAnswersMap = fb.studentAnswersMap;
+      if (fb.teacherNote) nextFb.summary = `${fb.teacherNote} (${g.feedbackJson.summary})`;
+      const { error } = await supabase
+        .from('submissions')
+        .update({
+          score: g.score,
+          status: g.hasUngradedOpen ? 'pending_review' : 'graded',
+          weak_topics: g.weakTopics,
+          ai_feedback_json: nextFb
+        })
+        .eq('id', sub.id);
+      if (error) failed += 1;
+      else ok += 1;
+    }
+    notify(
+      failed > 0
+        ? `Đã chấm lại ${ok} bài, ${failed} bài bị lỗi khi lưu.`
+        : `Đã chấm lại ${ok} bài nộp theo đáp án hiện tại!`,
+      failed > 0 ? 'error' : 'success'
+    );
+    fetchAllData();
+  };
+
+  const requestRegradeAssignment = (asg) => {
+    const items = submissions.filter((s) => s.assignment_id === asg.id).map((sub) => ({ sub, asg }));
+    if (items.length === 0) {
+      notify('Đề này chưa có bài nộp nào để chấm lại.', 'error');
+      return;
+    }
+    setConfirmDialog({
+      title: `Chấm lại ${items.length} bài nộp của "${asg.title}"?`,
+      message:
+        'Hệ thống chấm lại theo đáp án hiện tại của đề và đáp án các em đã chọn (không cần học sinh làm lại). Với câu trắc nghiệm, kết quả Đúng/Sai chỉnh tay trước đó sẽ được thay bằng kết quả chấm lại.',
+      confirmText: 'Chấm lại',
+      onConfirm: () => applyRegrade(items)
+    });
+  };
+
   const requestDeleteSubmission = (sub, studentName = '') => {
     setConfirmDialog({
-      title: 'Xóa lượt nộp bài này?',
-      message: `Xóa lượt nộp của ${studentName || sub.student_code}? Sau khi xóa, dữ liệu test sẽ sạch và học sinh này có thể làm lại bài từ đầu.`,
-      confirmText: 'Xóa lượt nộp',
+      title: 'Xóa lượt nộp & cho học sinh làm lại?',
+      message: `Xóa lượt nộp của ${studentName || sub.student_code}? Em ấy sẽ làm lại bài từ đầu. (Nếu chỉ bị chấm sai do đáp án, anh dùng nút "Chấm lại" thay vì xóa.)`,
+      confirmText: 'Xóa & cho làm lại',
       onConfirm: async () => {
         const { error } = await supabase.from('submissions').delete().eq('id', sub.id);
         if (error) notify(error.message, 'error');
@@ -2749,7 +2961,7 @@ export default function App() {
       setRawExtractedText(extracted.plainText);
 
       const questions = parseQuestionsFromExtractedContent(extracted);
-      setParsedQuestions(questions);
+      setParsedQuestions(questions.map(sanitizeQuestion));
 
       const autoKeys = questions
         .filter((q) => q.correctAnswer)
@@ -2786,7 +2998,7 @@ export default function App() {
     try {
       const aiQuestions = await parseQuestionsWithGeminiAI(rawExtractedText, geminiApiKey);
       if (aiQuestions.length > 0) {
-        setParsedQuestions(aiQuestions);
+        setParsedQuestions(aiQuestions.map(sanitizeQuestion));
         const autoKeys = aiQuestions
           .filter((q) => q.correctAnswer)
           .map((q) => `${q.number}:${q.correctAnswer}`)
@@ -2840,7 +3052,9 @@ export default function App() {
 
   const updateParsedQuestion = (idx, patch) => {
     setParsedQuestions((prev) => {
-      const next = prev.map((q, i) => (i === idx ? { ...q, ...patch } : q));
+      const next = prev.map((q, i) =>
+        i === idx ? { ...q, ...patch, ...('correctAnswer' in patch ? { keyIssue: '' } : {}) } : q
+      );
       const autoKeys = next
         .filter((q) => q.correctAnswer)
         .map((q) => `${q.number}:${q.correctAnswer}`)
@@ -3023,7 +3237,7 @@ export default function App() {
       }
 
       const cls = classes.find((c) => c.id === asgClassId) || null;
-      const cleanQuestions = parsedQuestions.map((q, idx) => ({
+      const cleanQuestions = parsedQuestions.map(sanitizeQuestion).map((q, idx) => ({
         ...q,
         type: q.type === 'mcq' ? 'mcq' : 'open',
         number: idx + 1
@@ -3187,12 +3401,13 @@ ${rawRubric}`;
 
     qList.forEach((q) => {
       const k = String(q.number);
-      if (!initialMarks[k] && q.correctAnswer && String(q.correctAnswer).trim() !== '') {
-        const exp = String(q.correctAnswer).trim().toLowerCase().replace(/\s+/g, '');
-        const act = String(ansMap[k] || '').trim().toLowerCase().replace(/\s+/g, '');
-        initialMarks[k] = act !== '' && act === exp ? 'correct' : 'wrong';
+      // MCQ with a valid key: always recompute (fixes old wrong breakdowns); open questions keep teacher marks
+      if (hasGradableKey(q) && (q.type === 'mcq' || !initialMarks[k])) {
+        initialMarks[k] = isAnswerCorrect(q, ansMap[k]) ? 'correct' : 'wrong';
         if (initialMarks[k] === 'wrong') {
-          initialNotes[k] = q.explanation || String(q.correctAnswer).trim();
+          initialNotes[k] = q.explanation || formatKeyForDisplay(q);
+        } else {
+          delete initialNotes[k];
         }
       }
     });
@@ -3419,6 +3634,29 @@ ${rawRubric}`;
     }, 150);
   };
 
+  // Submissions whose stored score differs from a re-grade with the current key
+  const regradeCandidates = useMemo(() => {
+    const asgById = {};
+    assignments.forEach((a) => {
+      asgById[a.id] = a;
+    });
+    const out = [];
+    submissions.forEach((sub) => {
+      const asg = asgById[sub.assignment_id];
+      if (!asg) return;
+      const g = regradeSubmission(sub, asg);
+      if (!g || g.hasUngradedOpen) return;
+      const fb = sub.ai_feedback_json || {};
+      const storedRaw =
+        fb.latestScore !== undefined && fb.latestScore !== null ? fb.latestScore : sub.score;
+      const stored = storedRaw === null || storedRaw === undefined ? null : Number(storedRaw);
+      if (stored === null || Math.abs(stored - g.score) > 0.001) {
+        out.push({ sub, asg, oldScore: stored, newScore: g.score });
+      }
+    });
+    return out;
+  }, [submissions, assignments]);
+
   const studentPortalData = useMemo(() => {
     if (!currentStudent) return null;
     const mySubs = submissions.filter((s) => s.student_id === currentStudent.id);
@@ -3479,6 +3717,8 @@ ${rawRubric}`;
   // Mở bài làm cho học sinh (Hỗ trợ xem lại, làm lại bài luyện tập, khôi phục nháp & đồng hồ)
   const handleOpenStudentAssignment = (task, forceRetry = false) => {
     setSubmittingAsg(task);
+    setShowSubmitConfirm(false);
+    setReviewWrongOnly(false);
     setStuPdfFile(null);
     setDraftRestoredBanner(false);
 
@@ -3995,15 +4235,13 @@ ${rawRubric}`;
           choiceCounts[stuAns] = (choiceCounts[stuAns] || 0) + 1;
         }
 
-        if (bItem) {
+        const canAuto = hasGradableKey(q) && (q.type === 'mcq' || !bItem);
+        if (canAuto) {
+          if (isAnswerCorrect(q, stuAns)) correctCount += 1;
+          else wrongCount += 1;
+        } else if (bItem) {
           if (bItem.status === 'wrong') wrongCount += 1;
           else if (bItem.status === 'correct') correctCount += 1;
-        } else if (q.correctAnswer) {
-          const isRight =
-            stuAns.toLowerCase().replace(/\s+/g, '') ===
-            String(q.correctAnswer).trim().toLowerCase().replace(/\s+/g, '');
-          if (isRight) correctCount += 1;
-          else wrongCount += 1;
         }
       });
 
@@ -4012,7 +4250,7 @@ ${rawRubric}`;
 
       // Tìm phương án sai bị chọn nhiều nhất
       const wrongChoices = Object.entries(choiceCounts)
-        .filter(([opt]) => opt.toUpperCase() !== String(q.correctAnswer || '').trim().toUpperCase())
+        .filter(([opt]) => opt.toUpperCase() !== getKeyLetterOrText(q).toUpperCase())
         .sort((a, b) => b[1] - a[1]);
 
       return {
@@ -4193,6 +4431,15 @@ ${rawRubric}`;
           if (b.status !== 'wrong') return;
           const qNumStr = String(b.question);
           const origQ = asgQuestions.find((q) => String(q.number) === qNumStr);
+          // Ignore stale "wrong" marks produced by an unreadable key in the past
+          if (
+            origQ &&
+            origQ.type === 'mcq' &&
+            hasGradableKey(origQ) &&
+            isAnswerCorrect(origQ, ansMap[qNumStr] || b.actual)
+          ) {
+            return;
+          }
           const uid = `${asg.id}__${qNumStr}`;
           if (!wrongMap.has(uid)) {
             wrongMap.set(uid, {
@@ -4215,12 +4462,10 @@ ${rawRubric}`;
       } else if (asgQuestions.length > 0 && sub.score !== null && sub.score !== undefined) {
         asgQuestions.forEach((origQ) => {
           const qNumStr = String(origQ.number);
-          const expected = String(origQ.correctAnswer || '').trim();
-          if (!expected) return;
+          if (!hasGradableKey(origQ)) return;
+          const expected = getKeyLetterOrText(origQ);
           const actual = String(ansMap[qNumStr] || '').trim();
-          const isRight =
-            actual !== '' &&
-            actual.toLowerCase().replace(/\s+/g, '') === expected.toLowerCase().replace(/\s+/g, '');
+          const isRight = isAnswerCorrect(origQ, actual);
           if (!isRight) {
             const uid = `${asg.id}__${qNumStr}`;
             if (!wrongMap.has(uid)) {
@@ -5195,6 +5440,49 @@ ${rawRubric}`;
                 )}
               </div>
 
+              {/* CẢNH BÁO BÀI NỘP BỊ CHẤM LỆCH SO VỚI ĐÁP ÁN HIỆN TẠI */}
+              {regradeCandidates.length > 0 && (
+                <div className="bg-amber-50 border-2 border-amber-300 rounded-3xl p-4 space-y-2">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div>
+                      <div className="font-bold text-amber-950 text-sm">
+                        ⚠️ Có {regradeCandidates.length} bài nộp đang có điểm khác với đáp án hiện tại của đề
+                      </div>
+                      <div className="text-xs text-amber-900">
+                        Thường do file đáp án trước đây bị đọc sai. Bấm chấm lại để trả điểm đúng — học sinh không cần làm lại.
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setConfirmDialog({
+                          title: `Chấm lại ${regradeCandidates.length} bài nộp?`,
+                          message:
+                            'Hệ thống chấm lại theo đáp án hiện tại và đáp án các em đã chọn. Điểm mới sẽ cập nhật ngay cho học sinh.',
+                          confirmText: 'Chấm lại tất cả',
+                          onConfirm: () => applyRegrade(regradeCandidates)
+                        })
+                      }
+                      className="shrink-0 inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      <span>Chấm lại {regradeCandidates.length} bài</span>
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5 text-[11px]">
+                    {regradeCandidates.slice(0, 10).map(({ sub, asg, oldScore, newScore }) => {
+                      const stu = students.find((x) => x.id === sub.student_id);
+                      return (
+                        <span key={sub.id} className="px-2 py-0.5 rounded-lg bg-white border border-amber-200 text-amber-900">
+                          {stu?.full_name || sub.student_code} • {asg.title}: {oldScore ?? '—'} → <strong>{newScore}</strong>
+                        </span>
+                      );
+                    })}
+                    {regradeCandidates.length > 10 && <span>… và {regradeCandidates.length - 10} bài khác</span>}
+                  </div>
+                </div>
+              )}
+
               {/* KHỐI 2: 4 KPI TỔNG QUAN */}
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
                 <div className="bg-white p-4 rounded-3xl border border-pink-200/80 shadow-sm shadow-pink-100/40">
@@ -5914,6 +6202,12 @@ ${rawRubric}`;
                             </div>
                           </div>
 
+                          {(q.keyIssue || (q.type === 'mcq' && !hasGradableKey(q))) && (
+                            <div className="px-2.5 py-1.5 rounded-lg bg-amber-50 border border-amber-300 text-[11px] font-semibold text-amber-900">
+                              ⚠️ {q.keyIssue || 'Chưa có đáp án A–D — bấm chữ cái bên dưới để chọn, nếu không câu này sẽ chờ GV chấm tay'}
+                            </div>
+                          )}
+
                           {q.passage && (
                             <div className="p-2 rounded-lg bg-pink-50/70 border border-pink-200 text-[11px] text-pink-950">
                               <span className="font-bold">📖 Bài đọc chung: </span>
@@ -6028,6 +6322,30 @@ ${rawRubric}`;
                     </div>
                   </>
                 )}
+
+                {(() => {
+                  const keyIssues = parsedQuestions
+                    .map((q, i) => ({ q, i }))
+                    .filter(({ q }) => q.keyIssue || (q.type === 'mcq' && !hasGradableKey(q)));
+                  if (parsedQuestions.length === 0 || keyIssues.length === 0) return null;
+                  return (
+                    <div className="p-3 rounded-xl bg-amber-50 border border-amber-300 text-xs text-amber-900 space-y-1">
+                      <div className="font-bold">
+                        ⚠️ {keyIssues.length}/{parsedQuestions.length} câu cần kiểm tra đáp án trước khi đăng
+                      </div>
+                      <div className="text-[11px]">
+                        Câu không có đáp án hợp lệ sẽ chuyển sang chờ giáo viên chấm tay (không bao giờ bị chấm Sai oan).
+                      </div>
+                      <ul className="list-disc pl-4 text-[11px] max-h-28 overflow-y-auto">
+                        {keyIssues.slice(0, 12).map(({ q, i }) => (
+                          <li key={q.id || i}>
+                            Câu {i + 1}: {q.keyIssue || 'Chưa có đáp án A–D'}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  );
+                })()}
 
                 <button
                   type="submit"
@@ -6149,6 +6467,17 @@ ${rawRubric}`;
                             <BarChart3 className="w-3.5 h-3.5" />
                             <span>Top câu sai & Bài nộp</span>
                           </button>
+                          {subCount > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => requestRegradeAssignment(a)}
+                              title="Chấm lại toàn bộ bài nộp theo đáp án hiện tại"
+                              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 font-semibold"
+                            >
+                              <RefreshCw className="w-3.5 h-3.5" />
+                              <span>Chấm lại</span>
+                            </button>
+                          )}
 
                           {(a.source_file_url || a.answer_key_url) && (
                             <a
@@ -7531,15 +7860,35 @@ ${rawRubric}`;
         const answeredCount = qList.filter(
           (q) => Boolean(stuInteractiveAnswers[String(q.number)]?.trim())
         ).length;
+        const unansweredList = qList.filter(
+          (q) => !String(stuInteractiveAnswers[String(q.number)] || '').trim()
+        );
+        // Live correctness for review (MCQ re-checked against the cleaned key)
+        const getLiveStatus = (q) => {
+          const k = String(q.number);
+          if (q.type === 'mcq' && hasGradableKey(q)) {
+            return isAnswerCorrect(q, stuInteractiveAnswers[k]) ? 'correct' : 'wrong';
+          }
+          return breakdownMap[k]?.status || null;
+        };
+        const wrongInReview = isLockedReview
+          ? qList.filter((q) => getLiveStatus(q) === 'wrong').length
+          : 0;
+        const scrollToQuestion = (k) =>
+          document.getElementById(`sc-q-${k}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
 
         return (
           <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4 overflow-y-auto">
             <form
               onSubmit={(e) => {
                 e.preventDefault();
-                if (!isLockedReview) submitStudentWork(false);
+                if (!isLockedReview) setShowSubmitConfirm(true);
               }}
-              className="bg-white rounded-2xl max-w-3xl w-full p-5 sm:p-6 shadow-2xl border border-slate-200 max-h-[92vh] flex flex-col gap-4"
+              onKeyDown={(e) => {
+                // Enter inside a text box must never submit the test
+                if (e.key === 'Enter' && e.target.tagName === 'INPUT') e.preventDefault();
+              }}
+              className="bg-white rounded-2xl max-w-3xl lg:max-w-5xl w-full p-5 sm:p-6 shadow-2xl border border-slate-200 max-h-[92vh] flex flex-col gap-4"
             >
               <div className="flex items-start justify-between border-b border-slate-100 pb-3 shrink-0 gap-2">
                 <div>
@@ -7666,6 +8015,64 @@ ${rawRubric}`;
                 </>
               )}
 
+              {qList.length > 1 && (
+                <div className="shrink-0 space-y-2">
+                  {!isLockedReview && (
+                    <div className="flex items-center gap-2">
+                      <div className="flex-1 h-2 rounded-full bg-slate-100 overflow-hidden">
+                        <div
+                          className="h-full bg-gradient-to-r from-pink-500 to-rose-500 transition-all"
+                          style={{ width: `${Math.round((answeredCount / qList.length) * 100)}%` }}
+                        />
+                      </div>
+                      <span className="text-[11px] font-bold text-slate-600 whitespace-nowrap">
+                        {answeredCount}/{qList.length} câu
+                      </span>
+                    </div>
+                  )}
+                  <div className="flex flex-wrap gap-1 max-h-20 overflow-y-auto">
+                    {qList.map((q) => {
+                      const k = String(q.number);
+                      const answered = Boolean(String(stuInteractiveAnswers[k] || '').trim());
+                      const live = isLockedReview && !hideAnswers ? getLiveStatus(q) : null;
+                      const chip =
+                        live === 'correct'
+                          ? 'bg-emerald-500 text-white border-emerald-500'
+                          : live === 'wrong'
+                          ? 'bg-rose-500 text-white border-rose-500'
+                          : answered
+                          ? 'bg-pink-600 text-white border-pink-600'
+                          : 'bg-white text-slate-500 border-dashed border-slate-300';
+                      return (
+                        <button
+                          key={k}
+                          type="button"
+                          onClick={() => {
+                            setReviewWrongOnly(false);
+                            setTimeout(() => scrollToQuestion(k), 30);
+                          }}
+                          title={`Đi tới câu ${q.number}`}
+                          className={`min-w-[30px] h-7 px-1 rounded-md border text-[11px] font-bold ${chip}`}
+                        >
+                          {q.number}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {isLockedReview && !hideAnswers && wrongInReview > 0 && (
+                    <label className="inline-flex items-center gap-1.5 text-xs font-semibold text-rose-700 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={reviewWrongOnly}
+                        onChange={(e) => setReviewWrongOnly(e.target.checked)}
+                        className="rounded text-rose-600"
+                      />
+                      <span>Chỉ xem {wrongInReview} câu làm sai</span>
+                    </label>
+                  )}
+                </div>
+              )}
+
               <div className="overflow-y-auto space-y-4 pr-1 flex-1">
                 {cleanRubric && (
                   <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-xs text-slate-700">
@@ -7679,8 +8086,10 @@ ${rawRubric}`;
                       const qKey = String(q.number);
                       const chosen = stuInteractiveAnswers[qKey] || '';
                       const bItem = breakdownMap[qKey];
+                      const liveStatus = isLockedReview ? getLiveStatus(q) : null;
+                      if (reviewWrongOnly && liveStatus !== 'wrong') return null;
                       const prevPassage = idx > 0 ? qList[idx - 1].passage : '';
-                      const showPassageBox = q.passage && q.passage !== prevPassage;
+                      const showPassageBox = q.passage && (q.passage !== prevPassage || reviewWrongOnly);
 
                       return (
                         <React.Fragment key={q.id || qKey}>
@@ -7698,10 +8107,11 @@ ${rawRubric}`;
                           )}
 
                           <div
-                            className={`p-4 rounded-2xl border space-y-3 ${
-                              isLockedReview && !hideAnswers && bItem?.status === 'correct'
+                            id={`sc-q-${qKey}`}
+                            className={`p-4 rounded-2xl border space-y-3 scroll-mt-4 ${
+                              isLockedReview && !hideAnswers && liveStatus === 'correct'
                                 ? 'bg-emerald-50/50 border-emerald-300'
-                                : isLockedReview && !hideAnswers && bItem?.status === 'wrong'
+                                : isLockedReview && !hideAnswers && liveStatus === 'wrong'
                                 ? 'bg-rose-50/50 border-rose-300'
                                 : 'bg-slate-50/70 border-slate-200'
                             }`}
@@ -7719,15 +8129,15 @@ ${rawRubric}`;
                                 {q.text}
                               </div>
 
-                              {isLockedReview && !hideAnswers && bItem && (
+                              {isLockedReview && !hideAnswers && liveStatus && (
                                 <span
                                   className={`px-2 py-0.5 rounded-md text-[11px] font-bold shrink-0 ${
-                                    bItem.status === 'correct'
+                                    liveStatus === 'correct'
                                       ? 'bg-emerald-600 text-white'
                                       : 'bg-rose-600 text-white'
                                   }`}
                                 >
-                                  {bItem.status === 'correct' ? '✓ Đúng' : '✗ Sai'}
+                                  {liveStatus === 'correct' ? '✓ Đúng' : '✗ Sai'}
                                 </span>
                               )}
                             </div>
@@ -7740,9 +8150,7 @@ ${rawRubric}`;
                                     const active = chosen.toUpperCase() === opt;
                                     const isCorrectOpt =
                                       isLockedReview &&
-                                      String(q.correctAnswer || bItem?.expected || '')
-                                        .trim()
-                                        .toUpperCase() === opt;
+                                      extractMcqLetter(q.correctAnswer || bItem?.expected || '', q.options).letter === opt;
 
                                     let btnStyle =
                                       'bg-white text-slate-800 border-slate-200 hover:border-pink-400';
@@ -7817,7 +8225,7 @@ ${rawRubric}`;
                                 )}
                                 {(q.correctAnswer || bItem?.expected) && (
                                   <div className="text-emerald-700 font-bold">
-                                    ✓ Đáp án chuẩn: {q.correctAnswer || bItem?.expected}
+                                    ✓ Đáp án chuẩn: {formatKeyForDisplay(q, bItem?.expected)}
                                   </div>
                                 )}
                                 {(q.explanation || bItem?.explanation) && (
@@ -7902,6 +8310,67 @@ ${rawRubric}`;
                 )}
               </div>
             </form>
+
+            {showSubmitConfirm && !isLockedReview && (
+              <div className="fixed inset-0 z-[70] bg-slate-900/50 flex items-center justify-center p-4">
+                <div className="bg-white rounded-2xl max-w-md w-full p-5 space-y-3 shadow-2xl border border-slate-200">
+                  <h4 className="font-bold text-slate-900">Nộp bài “{submittingAsg.title}”?</h4>
+                  {qList.length > 0 && (
+                    <p className="text-sm text-slate-700">
+                      Em đã làm <strong>{answeredCount}/{qList.length}</strong> câu.
+                    </p>
+                  )}
+                  {qList.length > 0 && answeredCount === 0 && (
+                    <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-xs font-bold text-rose-700">
+                      Em chưa chọn đáp án nào — nộp bây giờ sẽ được 0 điểm!
+                    </div>
+                  )}
+                  {unansweredList.length > 0 && answeredCount > 0 && (
+                    <div className="p-2.5 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900 space-y-1.5">
+                      <div className="font-bold">Còn {unansweredList.length} câu chưa làm:</div>
+                      <div className="flex flex-wrap gap-1">
+                        {unansweredList.slice(0, 30).map((q) => (
+                          <button
+                            key={q.number}
+                            type="button"
+                            onClick={() => {
+                              setShowSubmitConfirm(false);
+                              setTimeout(() => scrollToQuestion(String(q.number)), 50);
+                            }}
+                            className="px-1.5 py-0.5 rounded bg-white border border-amber-300 font-bold hover:bg-amber-100"
+                          >
+                            {q.number}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {asgMeta.assignmentType !== 'practice' && (
+                    <p className="text-xs text-slate-500">Sau khi nộp, bài sẽ bị khóa và không làm lại được.</p>
+                  )}
+                  <div className="flex gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setShowSubmitConfirm(false)}
+                      className="flex-1 py-2.5 rounded-xl bg-pink-600 hover:bg-pink-700 text-white text-sm font-bold"
+                    >
+                      Quay lại làm tiếp
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isSubmitting}
+                      onClick={() => {
+                        setShowSubmitConfirm(false);
+                        submitStudentWork(false);
+                      }}
+                      className="flex-1 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-sm font-bold disabled:opacity-50"
+                    >
+                      Nộp bài
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         );
       })()}

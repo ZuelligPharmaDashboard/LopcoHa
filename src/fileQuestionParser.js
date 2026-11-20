@@ -120,10 +120,8 @@ function extractBoldAnswersFromHtml(htmlText) {
 
     const highlighted = [];
     ['A', 'B', 'C', 'D'].forEach((opt) => {
-      const pattern = new RegExp(
-        `<(?:strong|b|u)>[^<]*\\b${opt}\\s*[.):][^<]*<\/(?:strong|b|u)>`,
-        'i'
-      );
+      // The bold/underlined run must start with the option letter (avoids matching instructions like "Choose A, B, C or D.")
+      const pattern = new RegExp(`<(?:strong|b|u)>\\s*\\(?${opt}\\s*[.):]`, 'i');
       if (pattern.test(chunk)) {
         highlighted.push(opt);
       }
@@ -138,70 +136,182 @@ function extractBoldAnswersFromHtml(htmlText) {
 }
 
 /**
+ * Loose text normalization for comparing answers (case, spaces, punctuation)
+ */
+export function normalizeLooseText(str) {
+  return String(str ?? '')
+    .normalize('NFC')
+    .toLowerCase()
+    .replace(/[\s.,;:!?'"“”‘’`()[\]{}…\-–—_]+/g, '');
+}
+
+/**
+ * Extract the MCQ letter (A-D) from a raw key such as:
+ * "B", "b)", "(B)", "B.", "B (ancient). ancient = ...", "Đáp án: B", or the option text itself ("ancient").
+ * Returns { letter, rest } — rest is any trailing explanation text.
+ */
+export function extractMcqLetter(raw, options = {}) {
+  let text = String(raw ?? '').trim();
+  if (!text) return { letter: '', rest: '' };
+  text = text.replace(/^(?:đáp\s*án(?:\s*đúng)?|đa|answer|ans|key)\s*[:.\-–—]?\s*/i, '').trim();
+  if (!text) return { letter: '', rest: '' };
+
+  const optEntries = ['A', 'B', 'C', 'D']
+    .map((k) => [k, normalizeLooseText(options?.[k])])
+    .filter(([, v]) => v);
+
+  // 1. The whole key equals one option text
+  const whole = normalizeLooseText(text);
+  const exact = optEntries.filter(([, v]) => v === whole);
+  if (exact.length === 1) return { letter: exact[0][0], rest: '' };
+
+  // 2. Leading letter: "B", "B.", "B)", "(B)", "B - ...", "B (ancient)..."
+  const m = text.match(/^[([]?\s*([A-Da-d])\s*(?=$|[)\].:,;=\-–—→>]|\s|\()/);
+  if (m) {
+    const isLower = m[1] === m[1].toLowerCase();
+    const after = text.slice(m[0].length);
+    // A lowercase letter followed by a plain word ("a book") is text, not a letter key
+    const looksLikeWord = isLower && /^\s+[a-zà-ỹ]/i.test(after) && !/^\s*[)\].:]/.test(after);
+    if (!looksLikeWord) {
+      let rest = after
+        .replace(/^\s*[)\]]/, '')
+        .replace(/^\s*[.:,;=\-–—→>]+\s*/, '')
+        .trim();
+      // Drop a leading "(option text)" echo
+      const echo = rest.match(/^\(([^)]*)\)\s*[.:,;\-–—]?\s*/);
+      if (echo) {
+        const echoNorm = normalizeLooseText(echo[1]);
+        const optNorm = normalizeLooseText(options?.[m[1].toUpperCase()]);
+        if (!optNorm || echoNorm === optNorm) rest = rest.slice(echo[0].length).trim();
+      }
+      return { letter: m[1].toUpperCase(), rest };
+    }
+  }
+
+  // 3. Key starts with exactly one option's text ("ancient = cổ đại...")
+  const prefix = optEntries.filter(([, v]) => v.length >= 2 && whole.startsWith(v));
+  if (prefix.length === 1) return { letter: prefix[0][0], rest: text };
+
+  return { letter: '', rest: text };
+}
+
+const KEY_HEADER_REGEX =
+  /^[-=*#_.\s]*(?:BẢNG\s*ĐÁP\s*ÁN|ĐÁP\s*ÁN(?:\s*(?:VÀ|&)\s*(?:GIẢI\s*THÍCH|HƯỚNG\s*DẪN))?|KEY\s*ĐÁP\s*ÁN|HƯỚNG\s*DẪN\s*(?:CHẤM|GIẢI)|LỜI\s*GIẢI(?:\s*CHI\s*TIẾT)?|ANSWER\s*KEYS?|ANSWERS|KEYS?)\b(.*)$/i;
+const INLINE_ANSWER_REGEX = /^(?:Đáp\s*án(?:\s*đúng)?|ĐA|Answer|Key)\s*[:.\-–—]\s*(.+)$/i;
+const EXPLANATION_LINE_REGEX = /^(?:Giải\s*thích|GT|Lời\s*giải|Hướng\s*dẫn|HD|Explanation|Explain)\s*[:.\-–—]\s*(.+)$/i;
+const KEY_LINE_EXPLANATION_REGEX =
+  /\(?\s*(?:Giải\s*thích|GT|HD|Hướng\s*dẫn|Lời\s*giải|Note|Explanation|Explain)\s*[:\-–—]\s*(.+?)\)?$/i;
+
+/**
+ * Is this line an answer-key header (and not an inline answer like "Đáp án: B")?
+ */
+export function isAnswerKeyHeader(line) {
+  const t = String(line || '').trim();
+  if (!t || t.length > 80) return false;
+  const m = t.match(KEY_HEADER_REGEX);
+  if (!m) return false;
+  const tail = (m[1] || '').trim();
+  // "Đáp án: B" / "Key: C" = inline answer of one question, not a section header
+  if (/^[:.\-–—]?\s*\(?[A-Da-d]\)?\s*(?:$|[.,;)\s])/.test(tail)) return false;
+  return true;
+}
+
+/**
+ * Parse an answer-key section into { keyMap (raw answer text), explanationMap }.
+ * Supported: "1. B", "1. B (ancient). giải thích", "Câu 1: B - vì...", "1 B" (table cells),
+ * "1.A 2.B 3.C" / "1A 2B" (many per line), horizontal tables (row of numbers + row of letters),
+ * "8. would join the charity club (Giải thích: ...)".
+ */
+export function parseAnswerKeyLines(keyLines) {
+  const keyMap = {};
+  const explanationMap = {};
+  const multiPairRegex = /(?:Câu\s*)?(\d{1,3})\s*[:.\-)]?\s*([A-D])(?=\s|$|,|;|\||\.)/g;
+
+  keyLines.forEach((kl) => {
+    const line = String(kl || '').trim();
+    if (!line) return;
+
+    // Many pairs on one line: "1.A 2.B 3.C" or "1A  2B  3C" or "1-A | 2-B"
+    const pairs = [...line.matchAll(multiPairRegex)];
+    if (pairs.length >= 2) {
+      const covered = pairs.map((p) => p[0]).join('').replace(/\s+/g, '').length;
+      if (covered >= line.replace(/[\s,;|]+/g, '').length * 0.8) {
+        pairs.forEach((p) => {
+          keyMap[p[1]] = p[2];
+        });
+        return;
+      }
+    }
+
+    // One answer per line (optional separator so table rows "1   B   ..." work)
+    const lineMatch = line.match(/^(?:Câu\s*|Question\s*|Q\s*)?(\d{1,3})\s*(?:[:.\-)–—]\s*|\s+)(.+)$/i);
+    if (lineMatch) {
+      const qNum = lineMatch[1];
+      let rest = lineMatch[2].trim();
+      const expMatch = rest.match(KEY_LINE_EXPLANATION_REGEX);
+      if (expMatch) {
+        explanationMap[qNum] = expMatch[1].trim();
+        rest = rest.slice(0, rest.indexOf(expMatch[0])).trim();
+      }
+      if (rest) keyMap[qNum] = rest;
+    }
+  });
+
+  // Horizontal table: a row of numbers followed by a row of letters
+  for (let i = 0; i < keyLines.length - 1; i += 1) {
+    const nums = String(keyLines[i]).match(/\b\d{1,3}\b/g);
+    const letterRow = String(keyLines[i + 1]).trim();
+    const letters = letterRow.match(/\b[A-Da-d]\b/g);
+    const onlyLetters = /^[A-Da-d\s|,;]+$/.test(letterRow);
+    if (nums && letters && onlyLetters && nums.length >= 2 && nums.length === letters.length) {
+      nums.forEach((n, idx) => {
+        keyMap[n] = letters[idx].toUpperCase();
+      });
+    }
+  }
+
+  return { keyMap, explanationMap };
+}
+
+/**
  * Tách bảng đáp án & giải thích ở cuối đề (nếu có)
+ * - Có tiêu đề (ĐÁP ÁN / ANSWER KEY / LỜI GIẢI...) -> phần sau tiêu đề là key
+ * - Không có tiêu đề nhưng cuối file là dãy "1.A 2.B..." -> tự nhận là key, không coi là câu hỏi
  */
 function extractAnswerKeySection(fullText) {
   const lines = fullText.split(/\r?\n/).map((l) => l.trim());
   let keyStartIdx = -1;
+  let keyFirstLine = 0;
 
   for (let i = 0; i < lines.length; i++) {
-    if (
-      /^(?:---\s*)?(?:ĐÁP\s*ÁN|BẢNG\s*ĐÁP\s*ÁN|HƯỚNG\s*DẪN\s*CHẤM|ANSWER\s*KEY|KEY\s*ĐÁP\s*ÁN)\b/i.test(
-        lines[i]
-      )
-    ) {
+    if (isAnswerKeyHeader(lines[i])) {
       keyStartIdx = i;
+      keyFirstLine = i + 1;
       break;
     }
   }
 
-  const bodyLines = keyStartIdx >= 0 ? lines.slice(0, keyStartIdx) : lines;
-  const keyLines = keyStartIdx >= 0 ? lines.slice(keyStartIdx + 1) : [];
-  const keyMap = {};
-  const explanationMap = {};
-
-  if (keyLines.length > 0) {
-    // 1. Dạng từng dòng: "1. B (Giải thích: ...)" hoặc "8. would join the charity club"
-    keyLines.forEach((kl) => {
-      const lineMatch = kl.match(/^(?:Câu\s*)?(\d+)\s*[:.\-)]\s*(.+)$/i);
-      if (lineMatch) {
-        const qNum = lineMatch[1];
-        let rest = lineMatch[2].trim();
-        const expMatch = rest.match(
-          /\(?\s*(?:Giải\s*thích|HD|Hướng\s*dẫn|Note)\s*[:\-]\s*(.+?)\)?$/i
-        );
-        if (expMatch) {
-          explanationMap[qNum] = expMatch[1].trim();
-          rest = rest.slice(0, expMatch.start ?? rest.indexOf(expMatch[0])).trim();
-        }
-        // Nếu dòng chỉ chứa 1 cặp câu-đáp án
-        if (rest && !/\b\d+\s*[:.\-)]\s*[A-Da-d]\b/.test(rest)) {
-          keyMap[qNum] = /^[A-Da-d]$/.test(rest) ? rest.toUpperCase() : rest;
-        }
-      }
-    });
-
-    // 2. Dạng nhiều cặp trên 1 dòng: "1.A  2.B  3.C  4.D"
-    const keyBlob = keyLines.join('\n');
-    const pairRegex = /(?:Câu\s*)?(\d+)\s*[:.\-)]\s*([A-Da-d])(?=\s|$|,|;|\|)/gi;
-    let m;
-    while ((m = pairRegex.exec(keyBlob)) !== null) {
-      if (!keyMap[m[1]]) {
-        keyMap[m[1]] = m[2].toUpperCase();
-      }
-    }
-
-    // 3. Dạng bảng ngang trên Word/PDF (Dòng 1: 1 2 3 4 5, Dòng 2: A C B D A)
-    for (let i = 0; i < keyLines.length - 1; i++) {
-      const nums = keyLines[i].match(/\b\d+\b/g);
-      const letters = keyLines[i + 1].match(/\b[A-Da-d]\b/g);
-      if (nums && letters && nums.length >= 2 && nums.length === letters.length) {
-        nums.forEach((n, idx) => {
-          keyMap[n] = letters[idx].toUpperCase();
-        });
-      }
+  // No header: detect a trailing block of pure key lines (e.g. "1.A 2.B 3.C" or "1. B" x many)
+  if (keyStartIdx < 0) {
+    const pureKeyLine = /^(?:(?:Câu\s*)?\d{1,3}\s*[:.\-)]?\s*[A-D]\b[\s,;|.]*)+$/;
+    let i = lines.length - 1;
+    while (i >= 0 && !lines[i]) i -= 1;
+    let j = i;
+    while (j >= 0 && (pureKeyLine.test(lines[j]) || !lines[j])) j -= 1;
+    const tailCount = lines.slice(j + 1, i + 1).filter(Boolean).length;
+    const pairCount = lines
+      .slice(j + 1, i + 1)
+      .join(' ')
+      .match(/\d{1,3}\s*[:.\-)]?\s*[A-D]\b/g);
+    if (tailCount > 0 && pairCount && pairCount.length >= 3) {
+      keyStartIdx = j + 1;
+      keyFirstLine = j + 1;
     }
   }
+
+  const bodyLines = keyStartIdx >= 0 ? lines.slice(0, keyStartIdx) : lines;
+  const keyLines = keyStartIdx >= 0 ? lines.slice(keyFirstLine) : [];
+  const { keyMap, explanationMap } = parseAnswerKeyLines(keyLines);
 
   return {
     bodyText: bodyLines.join('\n'),
@@ -291,7 +401,15 @@ export function parseQuestionsFromExtractedContent({ plainText, htmlText = '' })
         rawLines: firstText ? [firstText] : []
       };
     } else if (currentBlock) {
-      currentBlock.rawLines.push(line);
+      const inlineAns = line.match(INLINE_ANSWER_REGEX);
+      const inlineExp = line.match(EXPLANATION_LINE_REGEX);
+      if (inlineAns) {
+        currentBlock.inlineAnswer = inlineAns[1].trim();
+      } else if (inlineExp) {
+        currentBlock.inlineExplanation = inlineExp[1].trim();
+      } else {
+        currentBlock.rawLines.push(line);
+      }
     } else if (inReadingZone || line.length >= 130) {
       // Đoạn văn dài xuất hiện trước nhóm câu hỏi -> gom làm bài đọc chung
       activePassageLines.push(line);
@@ -315,7 +433,7 @@ export function parseQuestionsFromExtractedContent({ plainText, htmlText = '' })
     ];
   }
 
-  const optMarkerRegex = /(?:^|[\s.?!…”"')…:;])([A-D])\s*[.)]\s*/g;
+  const optMarkerRegex = /(?:^|[\s.?!…”"')…:;])([A-Da-d])\s*[.)]\s*/g;
   const expectedOrder = ['A', 'B', 'C', 'D'];
 
   const parsedQuestions = blocks.map((blk, idx) => {
@@ -326,7 +444,20 @@ export function parseQuestionsFromExtractedContent({ plainText, htmlText = '' })
     const seqMatches = [];
     let expIdx = 0;
 
-    for (const m of allMatches) {
+    // Use uppercase markers when present; lowercase a) b) c) only as a fallback
+    const upperOnly = allMatches.filter((m) => m[1] === m[1].toUpperCase());
+    const lowerOnly = allMatches.filter((m) => m[1] !== m[1].toUpperCase());
+    const countSeq = (list) => {
+      let k = 0;
+      list.forEach((m) => {
+        if (k < 4 && m[1].toUpperCase() === expectedOrder[k]) k += 1;
+      });
+      return k;
+    };
+    const markerList =
+      countSeq(upperOnly) >= 2 ? upperOnly : countSeq(lowerOnly) >= 3 ? lowerOnly : [];
+
+    for (const m of markerList) {
       const letter = m[1].toUpperCase();
       if (expIdx < 4 && letter === expectedOrder[expIdx]) {
         const letterRelIdx = m[0].search(/[A-D]/i);
@@ -354,19 +485,50 @@ export function parseQuestionsFromExtractedContent({ plainText, htmlText = '' })
     }
 
     const hasOptions = Boolean(options.A || options.B || options.C || options.D);
-    const detectedAnswer = combinedKeyMap[qNum] || '';
-    const detectedExplanation = explanationMap[qNum] || '';
+    const rawKey = blk.inlineAnswer || keyMap[qNum] || boldMap[qNum] || '';
+    let explanation = blk.inlineExplanation || explanationMap[qNum] || '';
+    let correctAnswer = rawKey;
+    let keyIssue = '';
+
+    if (hasOptions && rawKey) {
+      const { letter, rest } = extractMcqLetter(rawKey, options);
+      if (letter) {
+        correctAnswer = letter;
+        if (!explanation && rest) explanation = rest;
+        const boldLetter = boldMap[qNum];
+        if (boldLetter && boldLetter !== letter) keyIssue = `Bảng đáp án ghi ${letter} nhưng file bôi đậm ${boldLetter}`;
+      } else {
+        correctAnswer = '';
+        if (!explanation) explanation = rawKey;
+        keyIssue = `Không đọc được đáp án A–D từ "${rawKey.slice(0, 40)}" → để GV chấm tay`;
+      }
+    } else if (!hasOptions && /^[A-Da-d]$/.test(String(rawKey).trim())) {
+      keyIssue = `Đáp án là "${rawKey}" nhưng không tách được phương án A–D của câu này`;
+    }
 
     return {
       id: `q-${qNum}-${idx}`,
       number: Number(qNum) || idx + 1,
+      sourceNumber: qNum,
       type: hasOptions ? 'mcq' : 'open',
       passage: blk.passage || '',
       text: stemText || `Câu hỏi số ${qNum}`,
       options,
-      correctAnswer: detectedAnswer,
-      explanation: detectedExplanation
+      correctAnswer,
+      explanation,
+      keyIssue
     };
+  });
+
+  // Flag duplicated question numbers (e.g. each Part restarts at 1) — answer keys may collide
+  const numCount = {};
+  parsedQuestions.forEach((q) => {
+    numCount[q.sourceNumber] = (numCount[q.sourceNumber] || 0) + 1;
+  });
+  parsedQuestions.forEach((q) => {
+    if (numCount[q.sourceNumber] > 1 && !q.keyIssue) {
+      q.keyIssue = `Số câu ${q.sourceNumber} bị trùng trong file (mỗi Part đánh lại từ 1?) — kiểm tra lại đáp án`;
+    }
   });
 
   return parsedQuestions;
@@ -428,21 +590,32 @@ ${rawText.slice(0, 30000)}`;
   const cleaned = rawOutput.replace(/^```json\s*|```$/g, '').trim();
   const arr = JSON.parse(cleaned);
 
-  return (Array.isArray(arr) ? arr : []).map((item, idx) => ({
-    id: `ai-q-${idx + 1}`,
-    number: Number(item.number) || idx + 1,
-    type: item.type === 'mcq' ? 'mcq' : 'open',
-    passage: String(item.passage || '').trim(),
-    text: String(item.text || '').trim(),
-    options: {
+  return (Array.isArray(arr) ? arr : []).map((item, idx) => {
+    const options = {
       A: String(item.options?.A || '').trim(),
       B: String(item.options?.B || '').trim(),
       C: String(item.options?.C || '').trim(),
       D: String(item.options?.D || '').trim()
-    },
-    correctAnswer: String(item.correctAnswer || '').trim(),
-    explanation: String(item.explanation || '').trim()
-  }));
+    };
+    const type = item.type === 'mcq' ? 'mcq' : 'open';
+    let correctAnswer = String(item.correctAnswer || '').trim();
+    let explanation = String(item.explanation || '').trim();
+    if (type === 'mcq' && correctAnswer) {
+      const { letter, rest } = extractMcqLetter(correctAnswer, options);
+      correctAnswer = letter;
+      if (!explanation && rest) explanation = rest;
+    }
+    return {
+      id: `ai-q-${idx + 1}`,
+      number: Number(item.number) || idx + 1,
+      type,
+      passage: String(item.passage || '').trim(),
+      text: String(item.text || '').trim(),
+      options,
+      correctAnswer,
+      explanation
+    };
+  });
 }
 
 /**
