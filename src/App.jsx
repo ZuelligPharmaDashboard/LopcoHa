@@ -258,7 +258,9 @@ function getAssignmentMeta(asg) {
     assignmentType: 'homework', // 'homework' | 'practice' | 'exam'
     maxAttempts: 1, // 0 = không giới hạn (chỉ áp dụng cho practice)
     shuffleQuestions: false,
-    hideAnswersUntilGraded: false
+    hideAnswersUntilGraded: false,
+    proctorEnabled: false, // camera + AI + fullscreen lock
+    maxViolations: 3 // auto-submit after N leaves (0 = warn only)
   };
   if (!asg || typeof asg.rubric !== 'string') {
     return defaults;
@@ -280,7 +282,12 @@ function getAssignmentMeta(asg) {
         assignmentType,
         maxAttempts,
         shuffleQuestions: Boolean(parsed.shuffleQuestions),
-        hideAnswersUntilGraded: Boolean(parsed.hideAnswersUntilGraded)
+        hideAnswersUntilGraded: Boolean(parsed.hideAnswersUntilGraded),
+        proctorEnabled: Boolean(parsed.proctorEnabled),
+        maxViolations:
+          parsed.maxViolations !== undefined && parsed.maxViolations !== null
+            ? Math.max(0, Number(parsed.maxViolations) || 0)
+            : 3
       };
     } catch {
       return defaults;
@@ -2396,7 +2403,7 @@ function isAnswersLockedForStudent(asg) {
 // Practice runner: do questions directly in the app and auto-grade instantly
 // items: [{ uid, q, sourceLabel }]
 // ---------------------------------------------------------------------------
-function PracticeRunner({ title, subtitle, items, onClose, onFinish }) {
+function PracticeRunner({ title, subtitle, items, onClose, onFinish, modeLabel = 'Luyện tập — không tính vào điểm' }) {
   const [activeItems, setActiveItems] = useState(items);
   const [answers, setAnswers] = useState({});
   const [result, setResult] = useState(null);
@@ -2450,7 +2457,7 @@ function PracticeRunner({ title, subtitle, items, onClose, onFinish }) {
           <div>
             <h3 className="font-bold text-base sm:text-lg text-slate-900">{title}</h3>
             <div className="text-xs text-slate-500 mt-0.5">
-              {subtitle} • <span className="font-semibold text-violet-700">Luyện tập — không tính vào điểm</span>
+              {subtitle} • <span className="font-semibold text-violet-700">{modeLabel}</span>
             </div>
           </div>
           <button type="button" onClick={onClose} className="text-slate-400 hover:text-slate-600 p-1">
@@ -3079,6 +3086,848 @@ function MistakeNotebookView({ student, assignments, mySubs, practiceData, onUpd
   );
 }
 
+// ============================================================================
+// EXAM PROCTORING: camera snapshots + on-device AI (people / phone) + screen lock
+// Students only see "camera monitoring is on" + leave warnings; snapshots & AI
+// flags are only shown to the teacher.
+// ============================================================================
+const PROCTOR_SNAP_EVERY_MS = 30000;
+const PROCTOR_DETECT_EVERY_MS = 6000;
+const PROCTOR_FLAG_SNAP_GAP_MS = 20000;
+const PROCTOR_RETENTION_DAYS = 30;
+const PROCTOR_MAX_SNAPS = 150;
+const PROCTOR_COUNTED = ['fullscreen', 'tab', 'blur', 'camera', 'reload'];
+const PROCTOR_EVENT_LABELS = {
+  fullscreen: 'Thoát chế độ toàn màn hình',
+  tab: 'Chuyển tab / ẩn trang thi',
+  blur: 'Chuyển sang cửa sổ / ứng dụng khác',
+  camera: 'Camera bị tắt giữa giờ',
+  reload: 'Tải lại / mở lại trang giữa giờ thi',
+  copy: 'Cố copy nội dung đề',
+  paste: 'Cố dán nội dung vào bài',
+  key: 'Bấm phím bị cấm (F12, DevTools...)',
+  autosubmit: 'Bị thu bài do rời bài quá số lần cho phép'
+};
+const PROCTOR_FLAG_LABELS = {
+  noPerson: 'Không thấy ai trước camera',
+  multiPerson: 'Có từ 2 người trở lên',
+  phone: 'Phát hiện điện thoại'
+};
+const PROCTOR_SNAP_REASON = {
+  start: 'Bắt đầu',
+  periodic: 'Định kỳ',
+  leave: 'Lúc rời bài',
+  return: 'Lúc quay lại',
+  ai: 'AI phát hiện bất thường'
+};
+
+const scScriptCache = {};
+function loadScriptOnce(src) {
+  if (!scScriptCache[src]) {
+    scScriptCache[src] = new Promise((resolve, reject) => {
+      const el = document.createElement('script');
+      el.src = src;
+      el.async = true;
+      el.onload = () => resolve();
+      el.onerror = () => {
+        delete scScriptCache[src];
+        reject(new Error(`Không tải được ${src}`));
+      };
+      document.head.appendChild(el);
+    });
+  }
+  return scScriptCache[src];
+}
+
+let scProctorModelPromise = null;
+function loadProctorModel() {
+  if (!scProctorModelPromise) {
+    scProctorModelPromise = (async () => {
+      await loadScriptOnce('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js');
+      await loadScriptOnce('https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js');
+      if (!window.cocoSsd) throw new Error('AI model missing');
+      return window.cocoSsd.load({ base: 'lite_mobilenet_v2' });
+    })().catch((err) => {
+      scProctorModelPromise = null;
+      throw err;
+    });
+  }
+  return scProctorModelPromise;
+}
+
+function formatDurationVi(ms) {
+  const s = Math.round((Number(ms) || 0) / 1000);
+  if (s < 60) return `${s} giây`;
+  return `${Math.floor(s / 60)} phút ${s % 60} giây`;
+}
+
+function formatClockVi(iso) {
+  if (!iso) return '';
+  return new Date(iso).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => resolve('');
+    r.readAsDataURL(blob);
+  });
+}
+
+// Teacher-facing risk assessment of one exam session
+function assessProctorLog(log) {
+  if (!log || typeof log !== 'object') return null;
+  const events = Array.isArray(log.events) ? log.events : [];
+  const leaves = events.filter((e) => PROCTOR_COUNTED.includes(e.type));
+  const awayMs = leaves.reduce((n, e) => n + (Number(e.durationMs) || 0), 0);
+  const fc = log.aiFlagCounts || {};
+  const tries = events.filter((e) => ['key', 'copy', 'paste'].includes(e.type)).length;
+  const autoSubmitted = events.some((e) => e.type === 'autosubmit');
+  const reasons = [];
+  if (leaves.length) reasons.push(`Rời bài ${leaves.length} lần (tổng ${formatDurationVi(awayMs)})`);
+  if (fc.phone) reasons.push(`AI thấy điện thoại ${fc.phone} lần`);
+  if (fc.multiPerson) reasons.push(`AI thấy từ 2 người ${fc.multiPerson} lần`);
+  if (fc.noPerson) reasons.push(`Vắng mặt trước camera ${fc.noPerson} lần`);
+  if (tries) reasons.push(`Thử copy / dán / F12 ${tries} lần`);
+  if (autoSubmitted) reasons.push('Bị hệ thống tự thu bài');
+  if (log.aiStatus === 'unavailable') reasons.push('AI không chạy được trên máy này — cần xem ảnh bằng mắt');
+  let level = 'ok';
+  if (leaves.length >= 2 || awayMs >= 30000 || fc.phone || fc.multiPerson || autoSubmitted || (fc.noPerson || 0) >= 3) {
+    level = 'suspect';
+  } else if (leaves.length === 1 || fc.noPerson || tries || log.aiStatus === 'unavailable') {
+    level = 'review';
+  }
+  return {
+    level,
+    reasons,
+    leaves: leaves.length,
+    awayMs,
+    snapsCount: Array.isArray(log.snaps) ? log.snaps.length : 0
+  };
+}
+
+const PROCTOR_LEVEL_UI = {
+  ok: { label: 'Bình thường', cls: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+  review: { label: 'Cần xem', cls: 'bg-amber-50 text-amber-800 border-amber-300' },
+  suspect: { label: 'Nghi vấn', cls: 'bg-rose-600 text-white border-rose-600' }
+};
+
+// ---------------------------------------------------------------------------
+// ExamProctor: entry gate (camera + fullscreen) and live monitoring
+// ---------------------------------------------------------------------------
+function ExamProctor({
+  requireCamera = true,
+  lockScreen = true,
+  maxViolations = 3,
+  initialLog,
+  uploadSnap,
+  onLogChange,
+  onViolationLimit,
+  onStarted,
+  onCancel,
+  previewMode = false
+}) {
+  const videoRef = useRef(null);
+  const streamRef = useRef(null);
+  const modelRef = useRef(null);
+  const leaveRef = useRef(null);
+  const lastFlagsRef = useRef([]);
+  const lastFlagSnapRef = useRef(0);
+  const limitFiredRef = useRef(false);
+  const camStateRef = useRef('idle');
+  const cbRef = useRef({});
+  cbRef.current = { uploadSnap, onLogChange, onViolationLimit, onStarted };
+
+  const [phase, setPhaseRaw] = useState('gate');
+  const phaseRef = useRef('gate');
+  const setPhase = (v) => {
+    phaseRef.current = v;
+    setPhaseRaw(v);
+  };
+  const [camState, setCamStateRaw] = useState('idle');
+  const [warning, setWarning] = useState(null);
+  const [, forceRender] = useState(0);
+  const fsSupported = typeof document !== 'undefined' && Boolean(document.fullscreenEnabled);
+  const useLock = lockScreen && fsSupported;
+
+  const logRef = useRef(null);
+  if (!logRef.current) {
+    const base = initialLog && typeof initialLog === 'object' ? initialLog : {};
+    logRef.current = {
+      startedAt: base.startedAt || null,
+      events: Array.isArray(base.events) ? [...base.events] : [],
+      snaps: Array.isArray(base.snaps) ? [...base.snaps] : [],
+      aiFlagCounts: { noPerson: 0, multiPerson: 0, phone: 0, ...(base.aiFlagCounts || {}) },
+      aiStatus: base.aiStatus || 'idle',
+      uploadsFailed: Number(base.uploadsFailed) || 0,
+      device: typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 160) : ''
+    };
+  }
+
+  const setCamState = (v) => {
+    camStateRef.current = v;
+    setCamStateRaw(v);
+  };
+  const commit = () => {
+    cbRef.current.onLogChange?.({ ...logRef.current });
+    forceRender((n) => n + 1);
+  };
+  const nowIso = () => new Date().toISOString();
+  const addEvent = (ev) => {
+    logRef.current.events = [...logRef.current.events, ev].slice(-400);
+    commit();
+  };
+  const countedViolations = () => logRef.current.events.filter((e) => PROCTOR_COUNTED.includes(e.type)).length;
+
+  const checkLimit = () => {
+    const n = countedViolations();
+    if (maxViolations > 0 && n >= maxViolations && !limitFiredRef.current) {
+      limitFiredRef.current = true;
+      addEvent({ type: 'autosubmit', at: nowIso() });
+      setWarning({ type: 'limit', count: n });
+      cbRef.current.onViolationLimit?.();
+    }
+    return n;
+  };
+
+  const captureSnap = async (reason, flags = []) => {
+    const video = videoRef.current;
+    if (!video || !video.videoWidth || logRef.current.snaps.length >= PROCTOR_MAX_SNAPS) return;
+    const canvas = document.createElement('canvas');
+    canvas.width = 320;
+    canvas.height = Math.round((320 * video.videoHeight) / video.videoWidth) || 240;
+    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+    const at = nowIso();
+    const blob = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', 0.6));
+    if (!blob) return;
+    let stored = null;
+    try {
+      stored = await cbRef.current.uploadSnap?.(blob, { reason, at });
+    } catch {
+      stored = null;
+    }
+    if (!stored?.url) {
+      logRef.current.uploadsFailed += 1;
+      commit();
+      return;
+    }
+    logRef.current.snaps = [...logRef.current.snaps, { at, reason, flags, url: stored.url, path: stored.path || '' }];
+    commit();
+  };
+
+  const registerLeave = (type) => {
+    if (phaseRef.current !== 'running' || leaveRef.current || limitFiredRef.current) return;
+    captureSnap('leave', lastFlagsRef.current);
+    addEvent({ type, at: nowIso(), durationMs: 0 });
+    leaveRef.current = { type, at: Date.now(), index: logRef.current.events.length - 1 };
+    const n = checkLimit();
+    if (!limitFiredRef.current) setWarning({ type, count: n });
+  };
+
+  const registerReturn = () => {
+    const lv = leaveRef.current;
+    if (!lv) return;
+    leaveRef.current = null;
+    logRef.current.events = logRef.current.events.map((e, i) =>
+      i === lv.index ? { ...e, durationMs: Date.now() - lv.at } : e
+    );
+    commit();
+    setTimeout(() => captureSnap('return', lastFlagsRef.current), 400);
+  };
+
+  const checkReturn = () => {
+    if (!leaveRef.current) return false;
+    if (document.visibilityState !== 'visible') return false;
+    if (useLock && !document.fullscreenElement) return false;
+    if (requireCamera && camStateRef.current !== 'on') return false;
+    registerReturn();
+    return true;
+  };
+
+  const startCamera = async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setCamState('unsupported');
+      return false;
+    }
+    setCamState('asking');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+        audio: false
+      });
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+      streamRef.current = stream;
+      stream.getVideoTracks()[0]?.addEventListener('ended', () => {
+        setCamState('off');
+        registerLeave('camera');
+      });
+      setCamState('on');
+      return true;
+    } catch {
+      setCamState('denied');
+      return false;
+    }
+  };
+
+  // Keep <video> attached to the stream whichever element is mounted
+  useEffect(() => {
+    const v = videoRef.current;
+    if (v && streamRef.current && v.srcObject !== streamRef.current) {
+      v.srcObject = streamRef.current;
+      const playing = v.play?.();
+      if (playing && typeof playing.catch === 'function') playing.catch(() => {});
+    }
+  });
+
+  const handleStart = async () => {
+    if (requireCamera && camStateRef.current !== 'on') {
+      const ok = await startCamera();
+      if (!ok) return;
+    }
+    if (useLock && !document.fullscreenElement) {
+      try {
+        await document.documentElement.requestFullscreen();
+      } catch {
+        // continue; leaving will still be detected
+      }
+    }
+    const resumed = Boolean(logRef.current.startedAt);
+    if (!resumed) logRef.current.startedAt = nowIso();
+    setPhase('running');
+    if (resumed) {
+      addEvent({ type: 'reload', at: nowIso() });
+      checkLimit();
+    } else {
+      commit();
+    }
+    cbRef.current.onStarted?.();
+    if (requireCamera) {
+      logRef.current.aiStatus = 'loading';
+      loadProctorModel()
+        .then((m) => {
+          modelRef.current = m;
+          logRef.current.aiStatus = 'ready';
+          commit();
+        })
+        .catch(() => {
+          logRef.current.aiStatus = 'unavailable';
+          commit();
+        });
+      setTimeout(() => captureSnap('start'), 1500);
+    }
+  };
+
+  // Monitoring listeners (only while the exam is running)
+  useEffect(() => {
+    if (phase !== 'running') return undefined;
+    const onKey = (e) => {
+      const k = String(e.key || '').toLowerCase();
+      const mod = e.ctrlKey || e.metaKey;
+      const blocked =
+        e.key === 'F12' ||
+        (mod && e.shiftKey && ['i', 'j', 'c', 'k'].includes(k)) ||
+        (mod && ['u', 's', 'p'].includes(k)) ||
+        (e.metaKey && e.altKey && ['i', 'j', 'c'].includes(k));
+      if (blocked) {
+        e.preventDefault();
+        e.stopPropagation();
+        addEvent({ type: 'key', at: nowIso(), detail: e.key });
+      }
+    };
+    const onCopy = (e) => {
+      e.preventDefault();
+      addEvent({ type: e.type === 'paste' ? 'paste' : 'copy', at: nowIso() });
+    };
+    const onCtx = (e) => e.preventDefault();
+    const onVis = () => {
+      if (document.visibilityState === 'hidden') registerLeave('tab');
+      else checkReturn();
+    };
+    const onBlur = () => registerLeave('blur');
+    const onFocus = () => checkReturn();
+    const onFs = () => {
+      if (useLock && !document.fullscreenElement) registerLeave('fullscreen');
+      else checkReturn();
+    };
+    const onBeforeUnload = (e) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('keydown', onKey, true);
+    document.addEventListener('copy', onCopy, true);
+    document.addEventListener('cut', onCopy, true);
+    document.addEventListener('paste', onCopy, true);
+    document.addEventListener('contextmenu', onCtx, true);
+    document.addEventListener('visibilitychange', onVis);
+    window.addEventListener('blur', onBlur);
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('fullscreenchange', onFs);
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => {
+      window.removeEventListener('keydown', onKey, true);
+      document.removeEventListener('copy', onCopy, true);
+      document.removeEventListener('cut', onCopy, true);
+      document.removeEventListener('paste', onCopy, true);
+      document.removeEventListener('contextmenu', onCtx, true);
+      document.removeEventListener('visibilitychange', onVis);
+      window.removeEventListener('blur', onBlur);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('fullscreenchange', onFs);
+      window.removeEventListener('beforeunload', onBeforeUnload);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase]);
+
+  // Periodic snapshots + on-device AI detection
+  useEffect(() => {
+    if (phase !== 'running' || !requireCamera) return undefined;
+    const snapTimer = setInterval(() => {
+      if (!leaveRef.current) captureSnap('periodic', lastFlagsRef.current);
+    }, PROCTOR_SNAP_EVERY_MS);
+    let busy = false;
+    const detTimer = setInterval(async () => {
+      const model = modelRef.current;
+      const video = videoRef.current;
+      if (busy || !model || !video || !video.videoWidth || document.visibilityState !== 'visible') return;
+      busy = true;
+      try {
+        const preds = await model.detect(video, 10, 0.35);
+        const persons = preds.filter((p) => p.class === 'person' && p.score >= 0.5).length;
+        const phone = preds.some((p) => p.class === 'cell phone' && p.score >= 0.45);
+        const flags = [];
+        if (persons === 0) flags.push('noPerson');
+        if (persons > 1) flags.push('multiPerson');
+        if (phone) flags.push('phone');
+        lastFlagsRef.current = flags;
+        if (flags.length) {
+          flags.forEach((f) => {
+            logRef.current.aiFlagCounts[f] = (logRef.current.aiFlagCounts[f] || 0) + 1;
+          });
+          if (Date.now() - lastFlagSnapRef.current > PROCTOR_FLAG_SNAP_GAP_MS) {
+            lastFlagSnapRef.current = Date.now();
+            captureSnap('ai', flags);
+          } else {
+            commit();
+          }
+        }
+      } catch {
+        // ignore a failed detection round
+      } finally {
+        busy = false;
+      }
+    }, PROCTOR_DETECT_EVERY_MS);
+    return () => {
+      clearInterval(snapTimer);
+      clearInterval(detTimer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, requireCamera]);
+
+  // Stop camera & leave fullscreen when the exam closes
+  useEffect(
+    () => () => {
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+      if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
+    },
+    []
+  );
+
+  const handleBackToExam = async () => {
+    if (warning?.type === 'camera' || (requireCamera && camStateRef.current !== 'on')) {
+      const ok = await startCamera();
+      if (!ok) return;
+    }
+    if (useLock && !document.fullscreenElement) {
+      try {
+        await document.documentElement.requestFullscreen();
+      } catch {
+        return;
+      }
+    }
+    checkReturn();
+    if (!leaveRef.current) setWarning(null);
+  };
+
+  const rules = [
+    requireCamera && 'Camera luôn bật trong suốt giờ thi.',
+    useLock && 'Bài thi chạy toàn màn hình — không thoát ra, không chuyển tab hay mở ứng dụng khác.',
+    'Không copy / dán, không bấm F12.',
+    maxViolations > 0
+      ? `Rời khỏi bài quá ${maxViolations} lần, hệ thống sẽ tự động thu bài.`
+      : 'Mọi lần rời khỏi bài đều được ghi lại và gửi cho giáo viên.'
+  ].filter(Boolean);
+
+  return (
+    <>
+      {phase === 'gate' && (
+        <div className="fixed inset-0 z-[80] bg-slate-900 flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl max-w-lg w-full p-6 shadow-2xl space-y-4">
+            <div className="text-center">
+              <div className="text-4xl">🛡️</div>
+              <h3 className="text-lg font-extrabold text-slate-900 mt-1">Phòng thi có giám sát</h3>
+              {previewMode && (
+                <div className="mt-1 text-[11px] font-bold text-violet-700">
+                  Chế độ làm thử của giáo viên — ảnh không lưu lên hệ thống
+                </div>
+              )}
+            </div>
+            <ul className="text-sm text-slate-700 space-y-1.5">
+              {rules.map((r) => (
+                <li key={r} className="flex gap-2">
+                  <span className="text-pink-600 font-bold">•</span>
+                  <span>{r}</span>
+                </li>
+              ))}
+            </ul>
+            {requireCamera && (
+              <div className="space-y-2">
+                {camState === 'on' ? (
+                  <video
+                    ref={videoRef}
+                    muted
+                    playsInline
+                    autoPlay
+                    className="w-full max-w-xs aspect-video mx-auto rounded-2xl bg-slate-900 object-cover"
+                  />
+                ) : (
+                  <div className="w-full max-w-xs aspect-video mx-auto rounded-2xl bg-slate-100 border border-dashed border-slate-300 flex items-center justify-center text-xs text-slate-500 text-center px-4">
+                    {camState === 'asking'
+                      ? 'Đang xin quyền camera — em bấm “Cho phép” nhé...'
+                      : camState === 'denied'
+                      ? 'Camera đang bị chặn. Em bấm biểu tượng camera / ổ khóa trên thanh địa chỉ → Cho phép, rồi bấm lại.'
+                      : camState === 'unsupported'
+                      ? 'Trình duyệt này không hỗ trợ camera. Em dùng Chrome / Edge / Safari bản mới nhé.'
+                      : 'Bấm “Bật camera” để kiểm tra khung hình.'}
+                  </div>
+                )}
+                {camState !== 'on' && (
+                  <button
+                    type="button"
+                    onClick={startCamera}
+                    className="w-full py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-sm font-bold"
+                  >
+                    🎥 Bật camera
+                  </button>
+                )}
+              </div>
+            )}
+            <div className="flex gap-2">
+              {onCancel && (
+                <button
+                  type="button"
+                  onClick={onCancel}
+                  className="px-4 py-2.5 rounded-xl bg-white border border-slate-300 text-slate-700 text-sm font-bold"
+                >
+                  Để sau
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={handleStart}
+                disabled={requireCamera && camState !== 'on'}
+                className="flex-1 py-2.5 rounded-xl bg-pink-600 hover:bg-pink-700 disabled:opacity-50 text-white text-sm font-bold"
+              >
+                {logRef.current.startedAt ? 'Tiếp tục làm bài' : 'Đồng ý & Bắt đầu làm bài'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {phase === 'running' && warning && (
+        <div className="fixed inset-0 z-[80] bg-rose-950 flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl max-w-md w-full p-6 shadow-2xl space-y-3 text-center">
+            <div className="text-4xl">⚠️</div>
+            {warning.type === 'limit' ? (
+              <>
+                <h3 className="text-lg font-extrabold text-rose-700">Hệ thống đã thu bài</h3>
+                <p className="text-sm text-slate-700">
+                  Em đã rời khỏi bài thi quá {maxViolations} lần. Bài làm đã được nộp và gửi cho giáo viên.
+                </p>
+              </>
+            ) : (
+              <>
+                <h3 className="text-lg font-extrabold text-rose-700">
+                  Em vừa rời khỏi bài thi{maxViolations > 0 ? ` (lần ${warning.count}/${maxViolations})` : ''}
+                </h3>
+                <p className="text-sm text-slate-700">{PROCTOR_EVENT_LABELS[warning.type] || 'Rời khỏi bài thi'}.</p>
+                {maxViolations > 0 && (
+                  <p className="text-xs font-semibold text-rose-600">
+                    Rời quá {maxViolations} lần, bài sẽ tự động bị thu.
+                  </p>
+                )}
+                <button
+                  type="button"
+                  onClick={handleBackToExam}
+                  className="w-full py-2.5 rounded-xl bg-pink-600 hover:bg-pink-700 text-white text-sm font-bold"
+                >
+                  {warning.type === 'camera' ? 'Bật lại camera & quay lại làm bài' : 'Quay lại làm bài'}
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {phase === 'running' && requireCamera && (
+        <div className="fixed bottom-3 right-3 z-[75] pointer-events-none">
+          <video
+            ref={videoRef}
+            muted
+            playsInline
+            autoPlay
+            className="w-28 h-20 sm:w-36 sm:h-24 rounded-xl object-cover border-2 border-white shadow-lg bg-slate-900"
+          />
+          <div className="mt-1 text-[10px] font-bold text-white bg-rose-600/90 rounded-md px-1.5 py-0.5 text-center">
+            ● Đang giám sát
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Teacher: proctoring timeline (snapshots + events sorted by time)
+// ---------------------------------------------------------------------------
+function ProctorTimeline({ log }) {
+  const [zoom, setZoom] = useState(null);
+  const a = assessProctorLog(log);
+  if (!a) return <div className="text-sm text-slate-400">Bài này không có dữ liệu giám sát.</div>;
+  const lv = PROCTOR_LEVEL_UI[a.level];
+  const items = [
+    ...(log.events || []).map((e) => ({ kind: 'event', at: e.at, e })),
+    ...(log.snaps || []).map((s) => ({ kind: 'snap', at: s.at, s }))
+  ].sort((x, y) => String(x.at).localeCompare(String(y.at)));
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={`px-2.5 py-1 rounded-full border text-xs font-bold ${lv.cls}`}>{lv.label}</span>
+        <span className="text-xs text-slate-600">
+          Bắt đầu {formatClockVi(log.startedAt)} • {a.snapsCount} ảnh • AI:{' '}
+          {log.aiStatus === 'ready' ? 'hoạt động' : log.aiStatus === 'unavailable' ? 'không chạy được' : 'đang tải / không bật'}
+          {log.uploadsFailed ? ` • ${log.uploadsFailed} ảnh tải lên lỗi` : ''}
+          {log.purgedAt ? ` • Ảnh đã tự xóa sau ${PROCTOR_RETENTION_DAYS} ngày` : ''}
+        </span>
+      </div>
+      {a.reasons.length > 0 && (
+        <ul className="text-xs text-slate-700 list-disc pl-5 space-y-0.5">
+          {a.reasons.map((r) => (
+            <li key={r}>{r}</li>
+          ))}
+        </ul>
+      )}
+
+      {(log.snaps || []).length > 0 && (
+        <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-2">
+          {log.snaps.map((s, i) => {
+            const bad = (s.flags || []).length > 0 || s.reason === 'leave';
+            return (
+              <button
+                key={`${s.at}-${i}`}
+                type="button"
+                onClick={() => setZoom(s)}
+                className={`relative rounded-xl overflow-hidden border-2 text-left ${bad ? 'border-rose-500' : 'border-slate-200'}`}
+              >
+                <img src={s.url} alt="" className="w-full aspect-[4/3] object-cover bg-slate-100" loading="lazy" />
+                <div className={`absolute bottom-0 inset-x-0 px-1 py-0.5 text-[9px] font-bold ${bad ? 'bg-rose-600 text-white' : 'bg-black/55 text-white'}`}>
+                  {formatClockVi(s.at)} • {(s.flags || []).length ? PROCTOR_FLAG_LABELS[s.flags[0]] : PROCTOR_SNAP_REASON[s.reason] || ''}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      <div className="space-y-1 max-h-72 overflow-y-auto pr-1">
+        {items
+          .filter((it) => it.kind === 'event' || (it.s.flags || []).length > 0)
+          .map((it, i) => (
+            <div key={i} className="flex items-start gap-2 text-xs">
+              <span className="font-mono text-slate-500 shrink-0 w-16">{formatClockVi(it.at)}</span>
+              {it.kind === 'event' ? (
+                <span className={PROCTOR_COUNTED.includes(it.e.type) || it.e.type === 'autosubmit' ? 'text-rose-700 font-semibold' : 'text-amber-800'}>
+                  {PROCTOR_EVENT_LABELS[it.e.type] || it.e.type}
+                  {it.e.durationMs ? ` — ${formatDurationVi(it.e.durationMs)}` : ''}
+                  {it.e.detail ? ` (${it.e.detail})` : ''}
+                </span>
+              ) : (
+                <span className="text-rose-700 font-semibold">
+                  AI: {(it.s.flags || []).map((f) => PROCTOR_FLAG_LABELS[f]).join(', ')}
+                </span>
+              )}
+            </div>
+          ))}
+      </div>
+
+      {zoom && (
+        <div className="fixed inset-0 z-[90] bg-black/80 flex items-center justify-center p-4" onClick={() => setZoom(null)}>
+          <div className="max-w-2xl w-full space-y-2" onClick={(e) => e.stopPropagation()}>
+            <img src={zoom.url} alt="" className="w-full rounded-2xl" />
+            <div className="text-white text-sm text-center">
+              {formatClockVi(zoom.at)} • {PROCTOR_SNAP_REASON[zoom.reason] || ''}
+              {(zoom.flags || []).length ? ` • ${zoom.flags.map((f) => PROCTOR_FLAG_LABELS[f]).join(', ')}` : ''}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ProctorReviewModal({ item, onClose }) {
+  if (!item) return null;
+  const { student, sub, asg } = item;
+  return (
+    <div className="fixed inset-0 z-[60] bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
+      <div className="bg-white rounded-2xl max-w-4xl w-full p-6 shadow-2xl border border-slate-200 max-h-[92vh] overflow-y-auto space-y-4">
+        <div className="flex items-start justify-between gap-2 border-b border-slate-200 pb-3">
+          <div>
+            <h2 className="text-lg font-bold text-slate-900">🛡️ Giám sát: {student?.full_name || sub.student_code}</h2>
+            <p className="text-xs text-slate-500">
+              {asg?.title} • Nộp lúc {sub.submitted_at ? new Date(sub.submitted_at).toLocaleString('vi-VN') : '—'} • Điểm{' '}
+              {sub.score ?? '—'}/10
+            </p>
+          </div>
+          <button onClick={onClose} className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-100">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+        <ProctorTimeline log={sub.ai_feedback_json?.proctor} />
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Teacher: try an assignment exactly like a student (nothing is saved)
+// ---------------------------------------------------------------------------
+function TeacherPreviewModal({ preview, onClose }) {
+  const [stage, setStage] = useState('intro');
+  const [useProctor, setUseProctor] = useState(Boolean(preview?.meta?.proctorEnabled));
+  const [proctorStarted, setProctorStarted] = useState(false);
+  const [proctorLog, setProctorLog] = useState(null);
+  if (!preview) return null;
+
+  const questions = (preview.questions || []).map(sanitizeQuestion);
+  const meta = preview.meta || {};
+  const ordered = getOrderedQuestionsForStudent(questions, 'GV-TEST', preview.id || 'preview', meta.shuffleQuestions);
+  const noKey = questions.filter((q) => !hasGradableKey(q));
+  const keyIssues = questions.filter((q) => q.keyIssue);
+  const numCount = {};
+  questions.forEach((q) => {
+    numCount[q.number] = (numCount[q.number] || 0) + 1;
+  });
+  const dupNums = Object.keys(numCount).filter((n) => numCount[n] > 1);
+  const mcqNoOptions = questions.filter((q) => q.type === 'mcq' && ['A', 'B', 'C', 'D'].filter((o) => q.options?.[o]).length < 2);
+  const issues = [
+    ...keyIssues.map((q) => `Câu ${q.number}: ${q.keyIssue}`),
+    ...noKey.filter((q) => !q.keyIssue).map((q) => `Câu ${q.number}: chưa có đáp án → học sinh làm xong sẽ chờ GV chấm tay`),
+    ...dupNums.map((n) => `Số câu ${n} bị trùng — đáp án có thể bị lẫn`),
+    ...mcqNoOptions.map((q) => `Câu ${q.number}: trắc nghiệm nhưng thiếu phương án A–D`)
+  ];
+
+  const typeLabel = meta.assignmentType === 'exam' ? 'Kiểm tra' : meta.assignmentType === 'practice' ? 'Luyện tập' : 'Bài về nhà';
+
+  if (stage === 'report') {
+    return (
+      <div className="fixed inset-0 z-[60] bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
+        <div className="bg-white rounded-2xl max-w-4xl w-full p-6 shadow-2xl max-h-[92vh] overflow-y-auto space-y-4">
+          <div className="flex items-start justify-between gap-2 border-b border-slate-200 pb-3">
+            <h2 className="text-lg font-bold text-slate-900">Kết quả thử giám sát — {preview.title}</h2>
+            <button onClick={onClose} className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-100">
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+          <p className="text-xs text-slate-500">Đây là đúng màn hình cô sẽ thấy với bài thật của học sinh (ảnh làm thử không lưu lên hệ thống).</p>
+          <ProctorTimeline log={proctorLog} />
+        </div>
+      </div>
+    );
+  }
+
+  if (stage === 'running') {
+    return (
+      <>
+        {useProctor && (
+          <ExamProctor
+            requireCamera
+            lockScreen
+            maxViolations={meta.maxViolations ?? 3}
+            previewMode
+            uploadSnap={async (blob) => ({ url: await blobToDataUrl(blob), path: '' })}
+            onLogChange={setProctorLog}
+            onViolationLimit={() => {}}
+            onStarted={() => setProctorStarted(true)}
+            onCancel={onClose}
+          />
+        )}
+        {(!useProctor || proctorStarted) && (
+          <PracticeRunner
+            title={`Làm thử: ${preview.title}`}
+            subtitle={`${ordered.length} câu • ${typeLabel}`}
+            modeLabel="Giáo viên làm thử — không lưu bài"
+            items={ordered.map((q) => ({ uid: `pv__${q.number}`, q }))}
+            onClose={() => (useProctor ? setStage('report') : onClose())}
+          />
+        )}
+      </>
+    );
+  }
+
+  return (
+    <div className="fixed inset-0 z-[60] bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
+      <div className="bg-white rounded-2xl max-w-2xl w-full p-6 shadow-2xl max-h-[92vh] overflow-y-auto space-y-4">
+        <div className="flex items-start justify-between gap-2 border-b border-slate-200 pb-3">
+          <div>
+            <h2 className="text-lg font-bold text-slate-900">👀 Làm thử: {preview.title}</h2>
+            <p className="text-xs text-slate-500">
+              {questions.length} câu • {typeLabel}
+              {meta.timeLimitMinutes ? ` • ${meta.timeLimitMinutes} phút` : ''}
+              {meta.shuffleQuestions ? ' • Đảo câu' : ''}
+              {meta.proctorEnabled ? ` • Giám sát (thu bài sau ${meta.maxViolations || 'không giới hạn'} lần rời)` : ''}
+            </p>
+          </div>
+          <button onClick={onClose} className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-100">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        {issues.length === 0 ? (
+          <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-sm font-semibold text-emerald-800">
+            ✅ Không phát hiện vấn đề: mọi câu đều có đáp án hợp lệ để tự chấm.
+          </div>
+        ) : (
+          <div className="p-3 rounded-xl bg-amber-50 border border-amber-300 text-xs text-amber-900 space-y-1">
+            <div className="font-bold text-sm">⚠️ Phát hiện {issues.length} vấn đề cần xem trước khi giao:</div>
+            <ul className="list-disc pl-5 max-h-48 overflow-y-auto">
+              {issues.map((t) => (
+                <li key={t}>{t}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        <label className="flex items-center gap-2 text-sm text-slate-700 cursor-pointer select-none">
+          <input type="checkbox" checked={useProctor} onChange={(e) => setUseProctor(e.target.checked)} className="rounded text-pink-600" />
+          <span>Thử luôn giám sát phòng thi (camera, AI, khóa toàn màn hình)</span>
+        </label>
+
+        <button
+          type="button"
+          onClick={() => setStage('running')}
+          disabled={questions.length === 0}
+          className="w-full py-3 rounded-xl bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white font-bold text-sm"
+        >
+          Bắt đầu làm thử như học sinh
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function TrendLineChart({ points, labelKey = 'label', valueKey = 'score', color = '#ec4899' }) {
   if (!points || points.length === 0) {
     return (
@@ -3249,6 +4098,8 @@ export default function App() {
   const [asgMaxAttempts, setAsgMaxAttempts] = useState('3'); // '2' | '3' | '5' | '0' (unlimited)
   const [asgShuffleQuestions, setAsgShuffleQuestions] = useState(true);
   const [asgHideAnswersOnExam, setAsgHideAnswersOnExam] = useState(false);
+  const [asgProctor, setAsgProctor] = useState(false);
+  const [asgMaxViolations, setAsgMaxViolations] = useState('3');
   const [asgAnswerKey, setAsgAnswerKey] = useState('');
   const [asgRubric, setAsgRubric] = useState('');
   const [sourceFile, setSourceFile] = useState(null);
@@ -3282,6 +4133,13 @@ export default function App() {
   const [isRetryingPractice, setIsRetryingPractice] = useState(false);
   const [showSubmitConfirm, setShowSubmitConfirm] = useState(false);
   const [reviewWrongOnly, setReviewWrongOnly] = useState(false);
+  const [proctorLog, setProctorLog] = useState(null);
+  const [proctorStarted, setProctorStarted] = useState(false);
+  const proctorLogRef = useRef(null);
+  const endsAtRef = useRef(null);
+  const submitRef = useRef(null);
+  const [teacherPreview, setTeacherPreview] = useState(null);
+  const [proctorReview, setProctorReview] = useState(null);
   const [stuInteractiveAnswers, setStuInteractiveAnswers] = useState({});
   const [stuAnswerInput, setStuAnswerInput] = useState('');
   const [stuPdfFile, setStuPdfFile] = useState(null);
@@ -3495,6 +4353,36 @@ export default function App() {
       // ignore
     }
   }, [dataReady, role, currentStudent, updateClassMeta]);
+
+  const proctorPurgeRanRef = useRef(false);
+  useEffect(() => {
+    if (!dataReady || role !== 'teacher' || !supabase || proctorPurgeRanRef.current) return;
+    proctorPurgeRanRef.current = true;
+    const cutoff = Date.now() - PROCTOR_RETENTION_DAYS * 86400000;
+    const stale = submissions.filter((sub) => {
+      const pr = sub.ai_feedback_json?.proctor;
+      const at = new Date(pr?.endedAt || sub.submitted_at || 0).getTime();
+      return pr && Array.isArray(pr.snaps) && pr.snaps.some((x) => x.path) && at < cutoff;
+    });
+    if (stale.length === 0) return;
+    (async () => {
+      for (const sub of stale) {
+        const pr = sub.ai_feedback_json.proctor;
+        const paths = pr.snaps.map((x) => x.path).filter(Boolean);
+        if (paths.length) await supabase.storage.from('homework-files').remove(paths);
+        await supabase
+          .from('submissions')
+          .update({
+            ai_feedback_json: {
+              ...sub.ai_feedback_json,
+              proctor: { ...pr, snaps: [], purgedAt: new Date().toISOString(), purgedCount: paths.length }
+            }
+          })
+          .eq('id', sub.id);
+      }
+      fetchAllData();
+    })().catch(() => {});
+  }, [dataReady, role, supabase, submissions, fetchAllData]);
 
   // Save the whole student meta map (status / note / custom tuition price)
   const persistStudentMetaMap = async (nextMap) => {
@@ -4020,7 +4908,9 @@ export default function App() {
         assignmentType: asgType,
         maxAttempts: asgType === 'practice' ? Math.max(0, Number(asgMaxAttempts) || 0) : 1,
         shuffleQuestions: asgType === 'exam' ? Boolean(asgShuffleQuestions) : false,
-        hideAnswersUntilGraded: asgType === 'exam' ? Boolean(asgHideAnswersOnExam) : false
+        hideAnswersUntilGraded: asgType === 'exam' ? Boolean(asgHideAnswersOnExam) : false,
+        proctorEnabled: Boolean(asgProctor),
+        maxViolations: Math.max(0, Number(asgMaxViolations) || 0)
       };
 
       const metaTag = `__SC_META__:${JSON.stringify(metaPayload)}`;
@@ -4084,6 +4974,22 @@ export default function App() {
       notify('Lỗi đăng bài: ' + err.message, 'error');
     } finally {
       setIsPublishingAsg(false);
+    }
+  };
+
+  const handlePatchAssignmentMeta = async (asg, patch, successMsg) => {
+    if (!supabase || !asg) return;
+    const nextMeta = { ...getAssignmentMeta(asg), ...patch };
+    const nextMetaTag = `__SC_META__:${JSON.stringify(nextMeta)}`;
+    const rawRubric = typeof asg.rubric === 'string' ? asg.rubric : '';
+    const updatedRubric = rawRubric.match(/__SC_META__:\{.*?\}/)
+      ? rawRubric.replace(/__SC_META__:\{.*?\}/, nextMetaTag)
+      : `${nextMetaTag}\n${rawRubric}`;
+    const { error } = await supabase.from('assignments').update({ rubric: updatedRubric }).eq('id', asg.id);
+    if (error) notify('Lỗi cập nhật đề: ' + error.message, 'error');
+    else {
+      notify(successMsg);
+      fetchAllData();
     }
   };
 
@@ -4478,6 +5384,10 @@ ${rawRubric}`;
     setSubmittingAsg(task);
     setShowSubmitConfirm(false);
     setReviewWrongOnly(false);
+    setProctorStarted(false);
+    setProctorLog(null);
+    proctorLogRef.current = null;
+    endsAtRef.current = null;
     setStuPdfFile(null);
     setDraftRestoredBanner(false);
 
@@ -4505,16 +5415,29 @@ ${rawRubric}`;
     const draftKey = `sc_draft_${currentStudent.student_code}_${task.id}`;
     try {
       const saved = JSON.parse(localStorage.getItem(draftKey) || 'null');
-      if (saved && (Object.keys(saved.answers || {}).length > 0 || saved.textAnswer)) {
+      if (
+        saved &&
+        (Object.keys(saved.answers || {}).length > 0 || saved.textAnswer || saved.proctor?.startedAt || saved.endsAt)
+      ) {
         setStuInteractiveAnswers(saved.answers || {});
         setStuAnswerInput(saved.textAnswer || '');
         setDraftRestoredBanner(true);
+        if (saved.proctor) {
+          setProctorLog(saved.proctor);
+          proctorLogRef.current = saved.proctor;
+        }
         if (meta.timeLimitMinutes > 0) {
-          setRemainingSeconds(
-            typeof saved.remainingSeconds === 'number'
-              ? saved.remainingSeconds
-              : meta.timeLimitMinutes * 60
-          );
+          // The clock keeps running even if the page was closed (no pausing by leaving)
+          if (typeof saved.endsAt === 'number') {
+            endsAtRef.current = saved.endsAt;
+            setRemainingSeconds(Math.max(0, Math.round((saved.endsAt - Date.now()) / 1000)));
+          } else {
+            setRemainingSeconds(
+              typeof saved.remainingSeconds === 'number'
+                ? saved.remainingSeconds
+                : meta.timeLimitMinutes * 60
+            );
+          }
         } else {
           setRemainingSeconds(null);
         }
@@ -4537,23 +5460,46 @@ ${rawRubric}`;
 
     const draftKey = `sc_draft_${currentStudent.student_code}_${submittingAsg.id}`;
     const hasContent =
-      Object.keys(stuInteractiveAnswers).length > 0 || Boolean(stuAnswerInput.trim());
+      Object.keys(stuInteractiveAnswers).length > 0 ||
+      Boolean(stuAnswerInput.trim()) ||
+      Boolean(proctorLog?.startedAt);
     if (hasContent || typeof remainingSeconds === 'number') {
-      localStorage.setItem(
-        draftKey,
-        JSON.stringify({
-          answers: stuInteractiveAnswers,
-          textAnswer: stuAnswerInput,
-          remainingSeconds,
-          savedAt: Date.now()
-        })
-      );
+      try {
+        localStorage.setItem(
+          draftKey,
+          JSON.stringify({
+            answers: stuInteractiveAnswers,
+            textAnswer: stuAnswerInput,
+            remainingSeconds,
+            endsAt: endsAtRef.current,
+            proctor: proctorLog || undefined,
+            savedAt: Date.now()
+          })
+        );
+      } catch {
+        // storage full: keep going
+      }
     }
-  }, [submittingAsg, currentStudent, stuInteractiveAnswers, stuAnswerInput, remainingSeconds, studentPortalData, isRetryingPractice]);
+  }, [submittingAsg, currentStudent, stuInteractiveAnswers, stuAnswerInput, remainingSeconds, studentPortalData, isRetryingPractice, proctorLog]);
+
+  // Upload one proctoring snapshot (public bucket, random path; auto-deleted after 30 days)
+  const uploadProctorSnap = async (blob, { at }) => {
+    if (!supabase || !submittingAsg || !currentStudent) return null;
+    const safeCode = String(currentStudent.student_code || 'HS').replace(/[^A-Za-z0-9-]/g, '_');
+    const path = `proctor/${submittingAsg.id}/${safeCode}/${Date.parse(at) || Date.now()}_${Math.random()
+      .toString(36)
+      .slice(2, 8)}.jpg`;
+    const { error } = await supabase.storage
+      .from('homework-files')
+      .upload(path, blob, { contentType: 'image/jpeg', upsert: false });
+    if (error) return null;
+    const { data } = supabase.storage.from('homework-files').getPublicUrl(path);
+    return { url: data?.publicUrl || '', path };
+  };
 
   // Học sinh nộp bài (hỗ trợ cả tự động thu bài khi hết giờ)
   const submitStudentWork = useCallback(
-    async (isAutoTimeout = false) => {
+    async (isAutoTimeout = false, autoReason = '') => {
       if (!submittingAsg || !currentStudent || !supabase || isSubmitting) return;
 
       const existingSub = studentPortalData?.subByAsg?.[submittingAsg.id];
@@ -4680,6 +5626,9 @@ ${rawRubric}`;
 
         const enrichedFeedbackJson = {
           ...finalFeedbackJson,
+          ...(proctorLogRef.current
+            ? { proctor: { ...proctorLogRef.current, endedAt: new Date().toISOString(), endReason: autoReason || (isAutoTimeout ? 'timeout' : 'submit') } }
+            : {}),
           attemptCount: currentAttemptNum,
           latestScore: finalScore,
           bestScore,
@@ -4734,9 +5683,15 @@ ${rawRubric}`;
         setIsRetryingPractice(false);
         setRemainingSeconds(null);
         setDraftRestoredBanner(false);
+        endsAtRef.current = null;
+        proctorLogRef.current = null;
+        setProctorLog(null);
+        setProctorStarted(false);
 
         notify(
-          isAutoTimeout
+          autoReason === 'violation'
+            ? 'Em đã rời bài thi quá số lần cho phép — hệ thống đã tự động thu bài.'
+            : isAutoTimeout
             ? `Hết giờ làm bài! Hệ thống đã tự động thu bài (${finalScore !== null ? `Điểm: ${finalScore}/10` : 'Chờ GV chấm'}).`
             : existingSub && finalScore !== null
             ? `Hoàn thành lần ${currentAttemptNum}: Đạt ${finalScore}/10 điểm (Điểm cao nhất: ${bestScore}/10)!`
@@ -4766,9 +5721,14 @@ ${rawRubric}`;
   );
 
   // Đồng hồ đếm ngược khi học sinh đang làm bài có giới hạn thời gian
+  submitRef.current = submitStudentWork;
+
   useEffect(() => {
     if (remainingSeconds === null || !submittingAsg || !currentStudent) return;
     if (studentPortalData?.subByAsg?.[submittingAsg.id] && !isRetryingPractice) return;
+    // Proctored exams: the clock starts only after the student passes the exam gate
+    if (getAssignmentMeta(submittingAsg).proctorEnabled && !proctorStarted) return;
+    if (!endsAtRef.current) endsAtRef.current = Date.now() + remainingSeconds * 1000;
 
     if (remainingSeconds <= 0) {
       submitStudentWork(true);
@@ -4776,14 +5736,13 @@ ${rawRubric}`;
     }
 
     const timer = setInterval(() => {
-      setRemainingSeconds((prev) => {
-        if (prev === null) return null;
-        return prev > 0 ? prev - 1 : 0;
-      });
+      setRemainingSeconds(() =>
+        endsAtRef.current ? Math.max(0, Math.round((endsAtRef.current - Date.now()) / 1000)) : null
+      );
     }, 1000);
 
     return () => clearInterval(timer);
-  }, [remainingSeconds, submittingAsg, currentStudent, studentPortalData, submitStudentWork, isRetryingPractice]);
+  }, [remainingSeconds, submittingAsg, currentStudent, studentPortalData, submitStudentWork, isRetryingPractice, proctorStarted]);
 
   // Danh sách học sinh theo lớp & trạng thái Đang học / Nghỉ học
   const classStudentsAll = useMemo(() => {
@@ -6885,6 +7844,30 @@ ${rawRubric}`;
                       </label>
                     </div>
                   )}
+
+                  <div className="flex flex-wrap items-center gap-3 pt-2 border-t border-pink-200/60 text-xs">
+                    <label className="inline-flex items-center gap-2 font-semibold text-slate-900 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={asgProctor}
+                        onChange={(e) => setAsgProctor(e.target.checked)}
+                        className="rounded border-rose-400 text-rose-600 focus:ring-rose-500"
+                      />
+                      <span>🛡️ Giám sát phòng thi (camera + AI + khóa toàn màn hình)</span>
+                    </label>
+                    {asgProctor && (
+                      <select
+                        value={asgMaxViolations}
+                        onChange={(e) => setAsgMaxViolations(e.target.value)}
+                        className="px-2 py-1 bg-white border border-slate-300 rounded-lg font-medium"
+                      >
+                        <option value="2">Rời bài 2 lần → thu bài</option>
+                        <option value="3">Rời bài 3 lần → thu bài</option>
+                        <option value="5">Rời bài 5 lần → thu bài</option>
+                        <option value="0">Chỉ cảnh báo, không thu bài</option>
+                      </select>
+                    )}
+                  </div>
                 </div>
 
                 {/* BẢNG XEM TRƯỚC & CHỐT ĐÁP ÁN TỪNG CÂU */}
@@ -7120,6 +8103,30 @@ ${rawRubric}`;
                   </>
                 )}
 
+                {parsedQuestions.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setTeacherPreview({
+                        id: 'draft',
+                        title: asgTitle.trim() || 'Đề nháp',
+                        questions: parsedQuestions,
+                        meta: {
+                          assignmentType: asgType,
+                          timeLimitMinutes:
+                            asgTimePreset === 'custom' ? Number(asgCustomMinutes) || 0 : Number(asgTimePreset) || 0,
+                          shuffleQuestions: asgType === 'exam' && asgShuffleQuestions,
+                          proctorEnabled: asgProctor,
+                          maxViolations: Math.max(0, Number(asgMaxViolations) || 0)
+                        }
+                      })
+                    }
+                    className="w-full py-2.5 rounded-xl bg-violet-50 hover:bg-violet-100 text-violet-800 border border-violet-200 font-bold text-sm"
+                  >
+                    👀 Làm thử đề này như học sinh (trước khi đăng)
+                  </button>
+                )}
+
                 {(() => {
                   const keyIssues = parsedQuestions
                     .map((q, i) => ({ q, i }))
@@ -7275,6 +8282,49 @@ ${rawRubric}`;
                               <span>Chấm lại</span>
                             </button>
                           )}
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setTeacherPreview({ id: a.id, title: a.title, questions: qList, meta })
+                            }
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-violet-50 hover:bg-violet-100 text-violet-800 border border-violet-200 font-semibold"
+                          >
+                            <Eye className="w-3.5 h-3.5" />
+                            <span>Làm thử</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handlePatchAssignmentMeta(
+                                a,
+                                { proctorEnabled: !meta.proctorEnabled },
+                                meta.proctorEnabled ? 'Đã tắt giám sát phòng thi.' : 'Đã bật giám sát phòng thi (camera + AI + khóa màn hình)!'
+                              )
+                            }
+                            className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border font-semibold ${
+                              meta.proctorEnabled
+                                ? 'bg-rose-600 hover:bg-rose-700 text-white border-rose-600'
+                                : 'bg-white hover:bg-rose-50 text-rose-700 border-rose-200'
+                            }`}
+                          >
+                            <span>🛡️ Giám sát: {meta.proctorEnabled ? 'Bật' : 'Tắt'}</span>
+                          </button>
+                          {(() => {
+                            const suspects = submissions.filter(
+                              (s) =>
+                                s.assignment_id === a.id &&
+                                assessProctorLog(s.ai_feedback_json?.proctor)?.level === 'suspect'
+                            ).length;
+                            return suspects > 0 ? (
+                              <button
+                                type="button"
+                                onClick={() => setAnalyticsAssignment(a)}
+                                className="px-2 py-1 rounded-lg bg-rose-600 text-white font-bold"
+                              >
+                                🚨 {suspects} nghi vấn
+                              </button>
+                            ) : null;
+                          })()}
 
                           {(a.source_file_url || a.answer_key_url) && (
                             <a
@@ -7587,6 +8637,16 @@ ${rawRubric}`;
         </main>
       )}
 
+      {/* MODAL GIÁM SÁT TỪNG BÀI & GIÁO VIÊN LÀM THỬ ĐỀ */}
+      {proctorReview && <ProctorReviewModal item={proctorReview} onClose={() => setProctorReview(null)} />}
+      {teacherPreview && (
+        <TeacherPreviewModal
+          key={`${teacherPreview.id}-${teacherPreview.title}`}
+          preview={teacherPreview}
+          onClose={() => setTeacherPreview(null)}
+        />
+      )}
+
       {/* MODAL PHIẾU BÁO HỌC PHÍ .PNG + VIETQR */}
       {receiptPreview && (
         <TuitionReceiptModal receipt={receiptPreview} onClose={() => setReceiptPreview(null)} notify={notify} />
@@ -7614,6 +8674,57 @@ ${rawRubric}`;
                 <X className="w-5 h-5" />
               </button>
             </div>
+
+            {/* GIÁM SÁT PHÒNG THI */}
+            {(() => {
+              const rank = { suspect: 2, review: 1, ok: 0 };
+              const rows = assignmentAnalyticsData.asgSubs
+                .filter((sub) => sub.ai_feedback_json?.proctor)
+                .map((sub) => ({
+                  sub,
+                  stu: students.find((x) => x.id === sub.student_id),
+                  a: assessProctorLog(sub.ai_feedback_json.proctor)
+                }))
+                .sort((x, y) => rank[y.a.level] - rank[x.a.level]);
+              if (rows.length === 0) return null;
+              const cnt = (lv) => rows.filter((r) => r.a.level === lv).length;
+              return (
+                <div className="space-y-2.5">
+                  <h3 className="text-sm font-bold text-slate-900 flex flex-wrap items-center gap-2">
+                    <span>🛡️ Giám sát phòng thi ({rows.length} bài)</span>
+                    <span className="px-2 py-0.5 rounded-full bg-rose-600 text-white text-[11px]">{cnt('suspect')} nghi vấn</span>
+                    <span className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 text-[11px]">{cnt('review')} cần xem</span>
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-[11px]">{cnt('ok')} bình thường</span>
+                  </h3>
+                  <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
+                    {rows.map(({ sub, stu, a }) => (
+                      <div
+                        key={sub.id}
+                        className="p-2.5 rounded-xl border border-slate-200 bg-slate-50/60 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs"
+                      >
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2">
+                            <span className="font-bold text-slate-900">{stu?.full_name || sub.student_code}</span>
+                            <span className={`px-2 py-0.5 rounded-full border text-[10px] font-bold ${PROCTOR_LEVEL_UI[a.level].cls}`}>
+                              {PROCTOR_LEVEL_UI[a.level].label}
+                            </span>
+                            <span className="text-slate-500">Điểm {sub.score ?? '—'}</span>
+                          </div>
+                          <div className="text-slate-600 truncate">{a.reasons.slice(0, 3).join(' • ') || 'Không có bất thường'}</div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setProctorReview({ student: stu, sub, asg: analyticsAssignment })}
+                          className="shrink-0 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-900 text-white font-semibold"
+                        >
+                          Xem ảnh & nhật ký
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })()}
 
             {/* TOP CÂU SAI NHIỀU NHẤT */}
             <div className="space-y-2.5">
@@ -8733,6 +9844,7 @@ ${rawRubric}`;
           asgMeta.assignmentType === 'practice' &&
           (asgMeta.maxAttempts === 0 || attemptCount < asgMeta.maxAttempts);
         const isLockedReview = Boolean(existingSub) && !isRetryingPractice;
+        const proctorOn = asgMeta.proctorEnabled && !isLockedReview;
         const hideAnswers =
           isLockedReview &&
           asgMeta.assignmentType === 'exam' &&
@@ -8818,17 +9930,19 @@ ${rawRubric}`;
                       <span>{formatSecondsMMSS(remainingSeconds)}</span>
                     </div>
                   )}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setSubmittingAsg(null);
-                      setIsRetryingPractice(false);
-                      setRemainingSeconds(null);
-                    }}
-                    className="text-slate-400 hover:text-slate-600 p-1"
-                  >
-                    <X className="w-5 h-5" />
-                  </button>
+                  {!(proctorOn && proctorStarted) && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSubmittingAsg(null);
+                        setIsRetryingPractice(false);
+                        setRemainingSeconds(null);
+                      }}
+                      className="text-slate-400 hover:text-slate-600 p-1"
+                    >
+                      <X className="w-5 h-5" />
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -8958,7 +10072,12 @@ ${rawRubric}`;
                 </div>
               )}
 
-              <div className="overflow-y-auto space-y-4 pr-1 flex-1">
+              <div className={`overflow-y-auto space-y-4 pr-1 flex-1 ${proctorOn ? 'select-none' : ''}`}>
+                {proctorOn && (
+                  <div className="px-3.5 py-2 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-800 font-semibold">
+                    🛡️ Bài thi có giám sát camera — không rời khỏi màn hình làm bài.
+                  </div>
+                )}
                 {cleanRubric && (
                   <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-xs text-slate-700">
                     {cleanRubric}
@@ -9143,7 +10262,7 @@ ${rawRubric}`;
                   )
                 )}
 
-                {!isLockedReview && (
+                {!isLockedReview && !proctorOn && (
                   <div className="pt-2">
                     <label className="flex items-center justify-between p-3 border border-dashed border-slate-300 rounded-xl bg-slate-50 hover:bg-slate-100 cursor-pointer transition">
                       <div className="flex items-center gap-2 text-xs text-slate-700">
@@ -9195,6 +10314,27 @@ ${rawRubric}`;
                 )}
               </div>
             </form>
+
+            {proctorOn && (
+              <ExamProctor
+                key={`proctor-${submittingAsg.id}`}
+                requireCamera
+                lockScreen
+                maxViolations={asgMeta.maxViolations}
+                initialLog={proctorLog}
+                uploadSnap={uploadProctorSnap}
+                onLogChange={(log) => {
+                  proctorLogRef.current = log;
+                  setProctorLog(log);
+                }}
+                onViolationLimit={() => submitRef.current?.(true, 'violation')}
+                onStarted={() => setProctorStarted(true)}
+                onCancel={() => {
+                  setSubmittingAsg(null);
+                  setRemainingSeconds(null);
+                }}
+              />
+            )}
 
             {showSubmitConfirm && !isLockedReview && (
               <div className="fixed inset-0 z-[70] bg-slate-900/50 flex items-center justify-center p-4">
