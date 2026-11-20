@@ -38,7 +38,8 @@ import {
   Wallet,
   Download,
   QrCode,
-  ClipboardList
+  ClipboardList,
+  Search
 } from 'lucide-react';
 import {
   getSupabaseClient,
@@ -548,11 +549,14 @@ const SC_TAG_VOCAB = '__SC_VOCAB_SCORES__:';
 const SC_TAG_MANUAL = '__SC_MANUAL_GRADES__:';
 const SC_TAG_CLASS_CFG = '__SC_CLASS_CFG__:';
 const SC_TAG_ATTENDANCE = '__SC_ATTENDANCE__:';
+const SC_TAG_PRACTICE = '__SC_PRACTICE__:';
+// classCfg/vocab/manual/attendance rows are keyed by class_id; practice rows by target_student_id
 const SC_CLASS_META_TAGS = {
   vocab: SC_TAG_VOCAB,
   manual: SC_TAG_MANUAL,
   classCfg: SC_TAG_CLASS_CFG,
-  attendance: SC_TAG_ATTENDANCE
+  attendance: SC_TAG_ATTENDANCE,
+  practice: SC_TAG_PRACTICE
 };
 
 // Payment account (Vietcombank)
@@ -2350,6 +2354,731 @@ function regradeSubmission(sub, asg) {
   return null;
 }
 
+// ============================================================================
+// STUDENT VIEWS: Bảng điểm 3 nguồn • Kho đề ôn tập (tự chấm) • Sổ tay câu sai
+// Practice results are stored per student in localStorage (never counted in official scores)
+// ============================================================================
+function scReadLocalJson(key, fallback) {
+  try {
+    const v = JSON.parse(localStorage.getItem(key) || 'null');
+    return v ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+
+// Wrong-answer state of one official submission question (null = not judgeable)
+function getOfficialQuestionStatus(q, sub) {
+  const fb = sub?.ai_feedback_json || {};
+  const ansMap = sub?.answers_json || fb.studentAnswersMap || {};
+  const k = String(q.number);
+  const actual = String(ansMap[k] || '').trim();
+  if (q.type === 'mcq' && hasGradableKey(q)) {
+    return { status: isAnswerCorrect(q, actual) ? 'correct' : 'wrong', actual };
+  }
+  const b = (fb.breakdown || []).find((x) => String(x.question) === k);
+  if (b && (b.status === 'correct' || b.status === 'wrong')) {
+    return { status: b.status, actual: actual || b.actual || '' };
+  }
+  if (hasGradableKey(q)) {
+    return { status: isAnswerCorrect(q, actual) ? 'correct' : 'wrong', actual };
+  }
+  return null;
+}
+
+function isAnswersLockedForStudent(asg) {
+  const meta = getAssignmentMeta(asg);
+  return meta.assignmentType === 'exam' && meta.hideAnswersUntilGraded;
+}
+
+// ---------------------------------------------------------------------------
+// Practice runner: do questions directly in the app and auto-grade instantly
+// items: [{ uid, q, sourceLabel }]
+// ---------------------------------------------------------------------------
+function PracticeRunner({ title, subtitle, items, onClose, onFinish }) {
+  const [activeItems, setActiveItems] = useState(items);
+  const [answers, setAnswers] = useState({});
+  const [result, setResult] = useState(null);
+  const [warnUnanswered, setWarnUnanswered] = useState(false);
+
+  const answeredCount = activeItems.filter((it) => String(answers[it.uid] || '').trim()).length;
+
+  const grade = () => {
+    const unanswered = activeItems.length - answeredCount;
+    if (unanswered > 0 && !warnUnanswered) {
+      setWarnUnanswered(true);
+      return;
+    }
+    const perItem = {};
+    let gradable = 0;
+    let correct = 0;
+    activeItems.forEach((it) => {
+      if (!hasGradableKey(it.q)) {
+        perItem[it.uid] = 'self';
+        return;
+      }
+      gradable += 1;
+      const ok = isAnswerCorrect(it.q, answers[it.uid]);
+      if (ok) correct += 1;
+      perItem[it.uid] = ok ? 'correct' : 'wrong';
+    });
+    const score = gradable > 0 ? Number(((correct / gradable) * 10).toFixed(1)) : null;
+    const res = { perItem, gradable, correct, score };
+    setResult(res);
+    setWarnUnanswered(false);
+    onFinish?.(res, activeItems, answers);
+  };
+
+  const restart = (onlyWrong) => {
+    if (onlyWrong && result) {
+      setActiveItems(activeItems.filter((it) => result.perItem[it.uid] === 'wrong'));
+    } else {
+      setActiveItems(items);
+    }
+    setAnswers({});
+    setResult(null);
+    setWarnUnanswered(false);
+  };
+
+  const wrongCount = result ? Object.values(result.perItem).filter((v) => v === 'wrong').length : 0;
+
+  return (
+    <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4">
+      <div className="bg-white rounded-2xl max-w-3xl lg:max-w-5xl w-full p-5 sm:p-6 shadow-2xl border border-slate-200 max-h-[92vh] flex flex-col gap-4">
+        <div className="flex items-start justify-between gap-2 border-b border-slate-100 pb-3 shrink-0">
+          <div>
+            <h3 className="font-bold text-base sm:text-lg text-slate-900">{title}</h3>
+            <div className="text-xs text-slate-500 mt-0.5">
+              {subtitle} • <span className="font-semibold text-violet-700">Luyện tập — không tính vào điểm</span>
+            </div>
+          </div>
+          <button type="button" onClick={onClose} className="text-slate-400 hover:text-slate-600 p-1">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        {result ? (
+          <div
+            className={`p-3.5 rounded-xl border shrink-0 flex flex-wrap items-center justify-between gap-2 ${
+              result.score !== null && result.score >= 8
+                ? 'bg-emerald-50 border-emerald-200'
+                : 'bg-amber-50 border-amber-200'
+            }`}
+          >
+            <div className="text-sm">
+              <strong className="text-lg">{result.score !== null ? `${result.score}/10` : '—'}</strong>
+              <span className="ml-2 text-slate-700">
+                Đúng {result.correct}/{result.gradable} câu tự chấm
+                {result.score !== null && result.score >= 8 ? ' — Giỏi lắm! 🌟' : ' — Xem lại câu sai bên dưới nhé!'}
+              </span>
+            </div>
+            <div className="flex gap-2">
+              {wrongCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => restart(true)}
+                  className="px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold"
+                >
+                  Làm lại {wrongCount} câu sai
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => restart(false)}
+                className="px-3 py-1.5 rounded-lg bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 text-xs font-bold"
+              >
+                <RotateCcw className="w-3.5 h-3.5 inline mr-1" />
+                Làm lại từ đầu
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 shrink-0">
+            <div className="flex-1 h-2 rounded-full bg-slate-100 overflow-hidden">
+              <div
+                className="h-full bg-gradient-to-r from-violet-500 to-pink-500 transition-all"
+                style={{ width: `${activeItems.length ? Math.round((answeredCount / activeItems.length) * 100) : 0}%` }}
+              />
+            </div>
+            <span className="text-[11px] font-bold text-slate-600 whitespace-nowrap">
+              {answeredCount}/{activeItems.length} câu
+            </span>
+          </div>
+        )}
+
+        <div className="overflow-y-auto space-y-4 pr-1 flex-1">
+          {activeItems.map((it, idx) => {
+            const { q } = it;
+            const chosen = String(answers[it.uid] || '');
+            const st = result ? result.perItem[it.uid] : null;
+            const prevPassage = idx > 0 ? activeItems[idx - 1].q.passage : '';
+            const showPassage = q.passage && q.passage !== prevPassage;
+            const keyLetter = q.type === 'mcq' ? extractMcqLetter(q.correctAnswer, q.options).letter : '';
+            return (
+              <React.Fragment key={it.uid}>
+                {showPassage && (
+                  <div className="p-4 rounded-2xl bg-pink-50/70 border border-pink-200 text-xs sm:text-sm text-slate-800 whitespace-pre-line leading-relaxed">
+                    <div className="text-xs font-bold text-pink-900 mb-1.5">📖 Đoạn văn đọc hiểu</div>
+                    {q.passage}
+                  </div>
+                )}
+                <div
+                  className={`p-4 rounded-2xl border space-y-3 ${
+                    st === 'correct'
+                      ? 'bg-emerald-50/50 border-emerald-300'
+                      : st === 'wrong'
+                      ? 'bg-rose-50/50 border-rose-300'
+                      : 'bg-slate-50/70 border-slate-200'
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="text-sm font-semibold text-slate-900 whitespace-pre-line">
+                      <span className="inline-block px-2 py-0.5 rounded-md bg-violet-600 text-white text-xs font-bold mr-2">
+                        Câu {idx + 1}
+                      </span>
+                      {it.sourceLabel && (
+                        <span className="inline-block px-2 py-0.5 rounded-md bg-slate-200 text-slate-700 text-[10px] font-semibold mr-2">
+                          {it.sourceLabel}
+                        </span>
+                      )}
+                      {q.text}
+                    </div>
+                    {st && st !== 'self' && (
+                      <span
+                        className={`px-2 py-0.5 rounded-md text-[11px] font-bold shrink-0 ${
+                          st === 'correct' ? 'bg-emerald-600 text-white' : 'bg-rose-600 text-white'
+                        }`}
+                      >
+                        {st === 'correct' ? '✓ Đúng' : '✗ Sai'}
+                      </span>
+                    )}
+                  </div>
+
+                  {q.type === 'mcq' ? (
+                    <div className="grid sm:grid-cols-2 gap-2">
+                      {['A', 'B', 'C', 'D']
+                        .filter((opt) => q.options?.[opt])
+                        .map((opt) => {
+                          const active = chosen.toUpperCase() === opt;
+                          let style = 'bg-white text-slate-800 border-slate-200 hover:border-violet-400';
+                          if (result) {
+                            if (opt === keyLetter) style = 'bg-emerald-600 text-white border-emerald-600';
+                            else if (active) style = 'bg-rose-600 text-white border-rose-600';
+                            else style = 'bg-white text-slate-500 border-slate-200 opacity-80';
+                          } else if (active) {
+                            style = 'bg-violet-600 text-white border-violet-600 shadow-sm';
+                          }
+                          return (
+                            <button
+                              key={opt}
+                              type="button"
+                              disabled={Boolean(result)}
+                              onClick={() => setAnswers((prev) => ({ ...prev, [it.uid]: opt }))}
+                              className={`text-left p-2.5 rounded-xl border text-xs flex items-start gap-2.5 transition ${style}`}
+                            >
+                              <span className="w-5 h-5 rounded-md font-bold flex items-center justify-center shrink-0 bg-white/90 text-slate-900 border border-slate-200">
+                                {opt}
+                              </span>
+                              <span className="pt-0.5">{q.options[opt]}</span>
+                            </button>
+                          );
+                        })}
+                    </div>
+                  ) : (
+                    <input
+                      type="text"
+                      disabled={Boolean(result)}
+                      value={chosen}
+                      onChange={(e) => setAnswers((prev) => ({ ...prev, [it.uid]: e.target.value }))}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') e.preventDefault();
+                      }}
+                      placeholder="Nhập câu trả lời của em..."
+                      className="w-full px-3.5 py-2 text-sm bg-white border border-slate-300 rounded-xl focus:ring-2 focus:ring-violet-400 outline-none disabled:bg-slate-100"
+                    />
+                  )}
+
+                  {result && (formatKeyForDisplay(q) || q.explanation) && (
+                    <div className="p-2.5 rounded-xl bg-white border border-slate-200 text-xs space-y-1">
+                      {formatKeyForDisplay(q) && (
+                        <div className="text-emerald-700 font-bold">✓ Đáp án: {formatKeyForDisplay(q)}</div>
+                      )}
+                      {st === 'self' && (
+                        <div className="text-amber-700 font-semibold">Câu tự luận — em tự đối chiếu với gợi ý nhé.</div>
+                      )}
+                      {q.explanation && (
+                        <div className="text-slate-700">
+                          💡 <strong>Giải thích:</strong> {q.explanation}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </React.Fragment>
+            );
+          })}
+        </div>
+
+        <div className="pt-2 border-t border-slate-100 shrink-0 space-y-2">
+          {warnUnanswered && !result && (
+            <div className="p-2.5 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900 font-semibold">
+              Em còn {activeItems.length - answeredCount} câu chưa làm. Bấm “Chấm điểm” lần nữa nếu vẫn muốn chấm luôn.
+            </div>
+          )}
+          {result ? (
+            <button
+              type="button"
+              onClick={onClose}
+              className="w-full py-2.5 rounded-xl bg-slate-800 hover:bg-slate-900 text-white font-semibold text-sm"
+            >
+              Đóng
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={grade}
+              disabled={activeItems.length === 0}
+              className="w-full py-3 rounded-xl bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white font-semibold text-sm"
+            >
+              Chấm điểm ngay
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 1) Bảng điểm đủ 3 nguồn (Web • Vocab • Chấm tay)
+// ---------------------------------------------------------------------------
+function StudentGradebookView({ student, unified, vocabData, manualData, mySubs, assignments }) {
+  const vocab = normalizeGridData(vocabData, 'vocab');
+  const manual = normalizeGridData(manualData, 'manual');
+  const fmt = (v) => (v === null || v === undefined ? '—' : Number(v).toFixed(1));
+  const scoreClass = (v) =>
+    v === null || v === undefined
+      ? 'bg-slate-100 text-slate-500'
+      : v >= 8
+      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+      : v >= 6.5
+      ? 'bg-pink-50 text-pink-700 border-pink-200'
+      : 'bg-rose-50 text-rose-700 border-rose-200';
+
+  const webRows = mySubs
+    .map((sub) => ({ sub, asg: assignments.find((a) => a.id === sub.assignment_id) }))
+    .filter((r) => r.asg);
+
+  return (
+    <div className="bg-white p-5 rounded-3xl border border-pink-200/80 shadow-sm shadow-pink-100/40 space-y-4">
+      <div>
+        <h2 className="font-bold text-slate-900">Bảng điểm của em (đủ 3 nguồn)</h2>
+        <p className="text-xs text-slate-500">Điểm trung bình = trung bình tất cả đầu điểm: bài trên web, Vocab hàng tuần và điểm cô chấm tay.</p>
+      </div>
+
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        {[
+          { label: 'Điểm TB tổng hợp', v: unified?.avg, n: unified?.items.length },
+          { label: 'Bài web', v: unified?.webAvg, n: unified?.webCount },
+          { label: 'Vocab', v: unified?.vocabAvg, n: unified?.vocabCount },
+          { label: 'Chấm tay', v: unified?.manualAvg, n: unified?.manualCount }
+        ].map((card, i) => (
+          <div key={card.label} className={`p-3 rounded-2xl border ${i === 0 ? 'border-pink-300 bg-pink-50/60' : 'border-slate-200 bg-slate-50/60'}`}>
+            <div className="text-[11px] font-semibold text-slate-500">{card.label}</div>
+            <div className={`text-2xl font-extrabold ${i === 0 ? 'text-pink-600' : 'text-slate-900'}`}>{fmt(card.v)}</div>
+            <div className="text-[10px] text-slate-400">{card.n || 0} đầu điểm</div>
+          </div>
+        ))}
+      </div>
+
+      {unified?.missingManual.length > 0 && (
+        <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-800">
+          <strong>⚠️ Em còn {unified.missingManual.length} bài chưa nộp (đang tính 0đ):</strong> {unified.missingManual.join(', ')}. Nộp bổ
+          sung cho cô để được chấm lại nhé!
+        </div>
+      )}
+
+      {vocab.columns.length > 0 && (
+        <div className="space-y-1.5">
+          <h3 className="text-xs font-bold uppercase tracking-wider text-violet-700">📘 Vocab hàng tuần</h3>
+          <div className="flex flex-wrap gap-2">
+            {vocab.columns.map((col) => {
+              const r = resolveGridCell(vocab.cells[col.id]?.[student.id], col, false);
+              return (
+                <div key={col.id} className={`px-3 py-2 rounded-xl border text-center min-w-[84px] ${scoreClass(r.status === 'graded' ? r.value : null)}`}>
+                  <div className="text-[10px] font-semibold opacity-80">{col.label}</div>
+                  <div className="text-sm font-bold">{r.status === 'graded' ? r.value.toFixed(1) : '—'}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {manual.columns.length > 0 && (
+        <div className="space-y-1.5">
+          <h3 className="text-xs font-bold uppercase tracking-wider text-sky-700">📝 Điểm cô chấm tay</h3>
+          <div className="flex flex-wrap gap-2">
+            {manual.columns.map((col) => {
+              const r = resolveGridCell(manual.cells[col.id]?.[student.id], col, true);
+              return (
+                <div
+                  key={col.id}
+                  className={`px-3 py-2 rounded-xl border text-center min-w-[110px] ${
+                    r.status === 'missing' ? 'bg-rose-600 text-white border-rose-600' : scoreClass(r.status === 'graded' ? r.value : null)
+                  }`}
+                >
+                  <div className="text-[10px] font-semibold opacity-80">{col.label}</div>
+                  <div className="text-sm font-bold">
+                    {r.status === 'missing' ? 'Chưa nộp' : r.status === 'graded' ? r.value.toFixed(1) : '—'}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {webRows.length > 0 && (
+        <div className="space-y-1.5">
+          <h3 className="text-xs font-bold uppercase tracking-wider text-pink-700">💻 Bài làm trên web</h3>
+          <div className="flex flex-wrap gap-2">
+            {webRows.map(({ sub, asg }) => {
+              const v = sub.score === null || sub.score === undefined ? null : Number(sub.score);
+              return (
+                <div key={sub.id} className={`px-3 py-2 rounded-xl border text-center min-w-[110px] max-w-[200px] ${scoreClass(v)}`}>
+                  <div className="text-[10px] font-semibold opacity-80 truncate">{asg.title}</div>
+                  <div className="text-sm font-bold">{v === null ? 'Chờ chấm' : v.toFixed(1)}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 2) Kho đề ôn tập: practice any submitted assignment again, auto-graded
+// ---------------------------------------------------------------------------
+function PracticeLibraryView({ student, assignments, subByAsg, practiceData, onUpdatePractice }) {
+  const history = practiceData?.runs || {};
+  const [runner, setRunner] = useState(null);
+  const [search, setSearch] = useState('');
+
+  const myTasks = assignments.filter(
+    (a) =>
+      (a.is_remedial && a.target_student_id === student.id) ||
+      (!a.is_remedial && (!a.class_id || a.class_id === student.class_id))
+  );
+  const eligible = myTasks.filter((a) => getAssignmentQuestions(a).length > 0 && subByAsg[a.id] && !isAnswersLockedForStudent(a));
+  const waiting = myTasks.filter((a) => getAssignmentQuestions(a).length > 0 && !subByAsg[a.id]);
+  const term = search.trim().toLowerCase();
+  const shown = eligible.filter(
+    (a) => !term || `${a.title} ${a.topic || ''}`.toLowerCase().includes(term)
+  );
+
+  const startPractice = (asg) => {
+    const qs = getAssignmentQuestions(asg);
+    setRunner({
+      asg,
+      items: qs.map((q) => ({ uid: `${asg.id}__${q.number}`, q }))
+    });
+  };
+
+  const handleFinish = (res, items, answers) => {
+    if (!runner) return;
+    const asgId = runner.asg.id;
+    onUpdatePractice((prev) => {
+      const runs = { ...(prev.runs || {}) };
+      const list = Array.isArray(runs[asgId]) ? runs[asgId] : [];
+      runs[asgId] = [...list, { score: res.score, at: new Date().toISOString() }].slice(-30);
+      // feed the mistake notebook
+      const nb = { ...(prev.notebook || {}) };
+      items.forEach((it) => {
+        const st = res.perItem[it.uid];
+        if (st === 'wrong') {
+          nb[it.uid] = {
+            ...(nb[it.uid] || {}),
+            mastered: false,
+            practiceWrong: (nb[it.uid]?.practiceWrong || 0) + 1,
+            lastAnswer: answers[it.uid] || ''
+          };
+        } else if (st === 'correct' && nb[it.uid]) {
+          nb[it.uid] = { ...nb[it.uid], mastered: true };
+        }
+      });
+      return { ...prev, runs, notebook: nb };
+    });
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-white p-5 rounded-3xl border border-violet-200 shadow-sm space-y-3">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <h2 className="font-bold text-slate-900">📚 Kho đề ôn tập</h2>
+            <p className="text-xs text-slate-500">
+              Làm lại bất kỳ đề nào em đã nộp, tự chấm ngay — <strong>không tính vào điểm</strong>, luyện bao nhiêu lần cũng được.
+            </p>
+          </div>
+          <div className="relative">
+            <Search className="w-4 h-4 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Tìm theo tên đề / Unit..."
+              className="pl-8 pr-3 py-2 text-sm bg-slate-50 border border-slate-200 rounded-xl w-full sm:w-64"
+            />
+          </div>
+        </div>
+        {waiting.length > 0 && (
+          <p className="text-[11px] text-slate-500">
+            {waiting.length} đề em chưa nộp chính thức sẽ tự vào kho sau khi em nộp bài.
+          </p>
+        )}
+      </div>
+
+      {shown.length === 0 ? (
+        <div className="bg-white p-8 rounded-3xl border border-slate-200 text-center text-sm text-slate-400">
+          {eligible.length === 0 ? 'Kho đề sẽ có đề sau khi em nộp bài đầu tiên.' : 'Không có đề nào khớp từ khóa.'}
+        </div>
+      ) : (
+        <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {shown.map((a) => {
+            const qs = getAssignmentQuestions(a);
+            const runs = Array.isArray(history[a.id]) ? history[a.id] : [];
+            const best = runs.reduce((m, r) => (r.score !== null && r.score > m ? r.score : m), -1);
+            const official = subByAsg[a.id]?.score;
+            return (
+              <div key={a.id} className="bg-white p-4 rounded-3xl border border-violet-200/80 shadow-sm flex flex-col gap-2.5">
+                <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-bold">
+                  {a.is_remedial ? (
+                    <span className="px-2 py-0.5 rounded-md bg-rose-50 text-rose-700">Ôn bổ trợ</span>
+                  ) : (
+                    <span className="px-2 py-0.5 rounded-md bg-pink-50 text-pink-700">Tuần {a.week_number}</span>
+                  )}
+                  <span className="px-2 py-0.5 rounded-md bg-slate-100 text-slate-600">{qs.length} câu</span>
+                </div>
+                <div>
+                  <h3 className="font-bold text-slate-900 leading-snug">{a.title}</h3>
+                  <div className="text-xs text-slate-500">Chuyên đề: {a.topic || 'Tổng hợp'}</div>
+                </div>
+                <div className="text-xs text-slate-600 space-y-0.5">
+                  <div>
+                    Điểm chính thức:{' '}
+                    <strong>{official === null || official === undefined ? 'Chờ chấm' : `${official}/10`}</strong>
+                  </div>
+                  <div>
+                    Luyện tập: <strong>{runs.length} lần</strong>
+                    {best >= 0 && (
+                      <>
+                        {' '}• Cao nhất <strong className="text-violet-700">{best}/10</strong>
+                      </>
+                    )}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => startPractice(a)}
+                  className="mt-auto inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl bg-violet-600 hover:bg-violet-700 text-white text-xs font-bold"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>{runs.length > 0 ? 'Luyện lại' : 'Luyện ngay'}</span>
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {runner && (
+        <PracticeRunner
+          title={runner.asg.title}
+          subtitle={`${runner.items.length} câu • ${runner.asg.topic || 'Tổng hợp'}`}
+          items={runner.items}
+          onClose={() => setRunner(null)}
+          onFinish={handleFinish}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 3) Sổ tay câu sai: wrong questions from official work + practice
+// ---------------------------------------------------------------------------
+// Collect wrong questions: official submissions + practice wrongs recorded in the notebook
+function computeNotebookEntries(assignments, mySubs, notebook) {
+  const asgById = {};
+  assignments.forEach((a) => {
+    asgById[a.id] = a;
+  });
+  const entries = new Map();
+  mySubs.forEach((sub) => {
+    const asg = asgById[sub.assignment_id];
+    if (!asg || isAnswersLockedForStudent(asg)) return;
+    getAssignmentQuestions(asg).forEach((q) => {
+      const st = getOfficialQuestionStatus(q, sub);
+      if (!st || st.status !== 'wrong') return;
+      const uid = `${asg.id}__${q.number}`;
+      entries.set(uid, { uid, asg, q, officialAnswer: st.actual || '(Bỏ trống)' });
+    });
+  });
+  Object.entries(notebook).forEach(([uid, info]) => {
+    if (entries.has(uid) || !info) return;
+    const [asgId, num] = uid.split('__');
+    const asg = asgById[asgId];
+    if (!asg || isAnswersLockedForStudent(asg)) return;
+    const q = getAssignmentQuestions(asg).find((x) => String(x.number) === String(num));
+    if (q) entries.set(uid, { uid, asg, q, officialAnswer: info.lastAnswer || '' });
+  });
+  return Array.from(entries.values()).map((e) => ({ ...e, mastered: Boolean(notebook[e.uid]?.mastered) }));
+}
+
+function MistakeNotebookView({ student, assignments, mySubs, practiceData, onUpdatePractice }) {
+  const notebook = practiceData?.notebook || {};
+  const [showMastered, setShowMastered] = useState(false);
+  const [runner, setRunner] = useState(null);
+
+  const all = computeNotebookEntries(assignments, mySubs, notebook);
+  const pending = all.filter((e) => !e.mastered);
+  const shown = showMastered ? all : pending;
+
+  const groups = {};
+  shown.forEach((e) => {
+    if (!groups[e.asg.id]) groups[e.asg.id] = { asg: e.asg, list: [] };
+    groups[e.asg.id].list.push(e);
+  });
+
+  const toggleMastered = (uid) => {
+    onUpdatePractice((prev) => {
+      const nb = { ...(prev.notebook || {}) };
+      nb[uid] = { ...(nb[uid] || {}), mastered: !nb[uid]?.mastered };
+      return { ...prev, notebook: nb };
+    });
+  };
+
+  const practiceList = (list) => {
+    if (list.length === 0) return;
+    setRunner(list.map((e) => ({ uid: e.uid, q: e.q, sourceLabel: e.asg.title })));
+  };
+
+  const handleFinish = (res, items) => {
+    onUpdatePractice((prev) => {
+      const nb = { ...(prev.notebook || {}) };
+      items.forEach((it) => {
+        const st = res.perItem[it.uid];
+        if (st === 'correct') nb[it.uid] = { ...(nb[it.uid] || {}), mastered: true };
+        if (st === 'wrong') nb[it.uid] = { ...(nb[it.uid] || {}), mastered: false, practiceWrong: (nb[it.uid]?.practiceWrong || 0) + 1 };
+      });
+      return { ...prev, notebook: nb };
+    });
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-white p-5 rounded-3xl border border-rose-200 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div>
+          <h2 className="font-bold text-slate-900">📒 Sổ tay câu sai</h2>
+          <p className="text-xs text-slate-500">
+            Tự gom mọi câu em từng làm sai. Luyện lại đúng là câu đó được đánh dấu <strong>Đã thuộc</strong>.
+          </p>
+          <div className="text-xs mt-1">
+            Còn <strong className="text-rose-600">{pending.length}</strong> câu cần ôn • Đã thuộc{' '}
+            <strong className="text-emerald-600">{all.length - pending.length}</strong> câu
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <label className="inline-flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer select-none">
+            <input type="checkbox" checked={showMastered} onChange={(e) => setShowMastered(e.target.checked)} className="rounded" />
+            <span>Hiện cả câu đã thuộc</span>
+          </label>
+          <button
+            type="button"
+            disabled={pending.length === 0}
+            onClick={() => practiceList(pending)}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white text-xs font-bold"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            <span>Luyện tất cả {pending.length} câu</span>
+          </button>
+        </div>
+      </div>
+
+      {shown.length === 0 ? (
+        <div className="bg-white p-8 rounded-3xl border border-slate-200 text-center text-sm text-slate-400">
+          {all.length === 0 ? 'Chưa có câu sai nào — em làm tốt lắm! 🌟' : 'Em đã thuộc hết các câu sai rồi! 🎉'}
+        </div>
+      ) : (
+        Object.values(groups).map(({ asg, list }) => (
+          <div key={asg.id} className="bg-white p-4 rounded-3xl border border-slate-200 shadow-sm space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h3 className="font-bold text-slate-900 text-sm">{asg.title}</h3>
+                <div className="text-[11px] text-slate-500">
+                  {list.length} câu • {asg.topic || 'Tổng hợp'}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => practiceList(list.filter((e) => !e.mastered))}
+                disabled={list.every((e) => e.mastered)}
+                className="px-3 py-1.5 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-xs font-bold disabled:opacity-50"
+              >
+                Luyện các câu này
+              </button>
+            </div>
+            <div className="space-y-2">
+              {list.map((e) => (
+                <div
+                  key={e.uid}
+                  className={`p-3 rounded-xl border text-xs space-y-1 ${e.mastered ? 'bg-emerald-50/50 border-emerald-200' : 'bg-rose-50/40 border-rose-200'}`}
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="font-semibold text-slate-900">
+                      <span className="inline-block px-1.5 py-0.5 rounded bg-slate-800 text-white text-[10px] mr-1.5">Câu {e.q.number}</span>
+                      {e.q.text}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => toggleMastered(e.uid)}
+                      className={`shrink-0 px-2 py-0.5 rounded-full text-[10px] font-bold border ${
+                        e.mastered ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-white text-slate-500 border-slate-300'
+                      }`}
+                    >
+                      {e.mastered ? '✓ Đã thuộc' : 'Đánh dấu đã thuộc'}
+                    </button>
+                  </div>
+                  {e.officialAnswer && (
+                    <div className="text-rose-700">
+                      Em đã chọn: <span className="line-through">{e.officialAnswer}</span>
+                    </div>
+                  )}
+                  {formatKeyForDisplay(e.q) && <div className="text-emerald-700 font-bold">✓ Đáp án: {formatKeyForDisplay(e.q)}</div>}
+                  {e.q.explanation && <div className="text-slate-700">💡 {e.q.explanation}</div>}
+                </div>
+              ))}
+            </div>
+          </div>
+        ))
+      )}
+
+      {runner && (
+        <PracticeRunner
+          title="Luyện lại câu sai"
+          subtitle={`${runner.length} câu từ sổ tay`}
+          items={runner}
+          onClose={() => setRunner(null)}
+          onFinish={handleFinish}
+        />
+      )}
+    </div>
+  );
+}
+
 function TrendLineChart({ points, labelKey = 'label', valueKey = 'score', color = '#ec4899' }) {
   if (!points || points.length === 0) {
     return (
@@ -2560,8 +3289,9 @@ export default function App() {
   const [draftRestoredBanner, setDraftRestoredBanner] = useState(false);
   const [remainingSeconds, setRemainingSeconds] = useState(null);
   // Class-level metadata (vocab / manual grades / tuition config / attendance) stored as announcement rows
-  const [classMeta, setClassMeta] = useState({ vocab: {}, manual: {}, classCfg: {}, attendance: {} });
-  const classMetaRef = useRef({ vocab: {}, manual: {}, classCfg: {}, attendance: {} });
+  const [classMeta, setClassMeta] = useState({ vocab: {}, manual: {}, classCfg: {}, attendance: {}, practice: {} });
+  const classMetaRef = useRef({ vocab: {}, manual: {}, classCfg: {}, attendance: {}, practice: {} });
+  const [dataReady, setDataReady] = useState(false);
   const classMetaRowIds = useRef({});
   const classMetaTimers = useRef({});
   const classMetaInFlight = useRef({});
@@ -2625,14 +3355,15 @@ export default function App() {
           setStudentMetaMap({});
         }
         // Parse class-level metadata rows (newest first -> keep the first row per type & class)
-        const nextMeta = { vocab: {}, manual: {}, classCfg: {}, attendance: {} };
+        const nextMeta = { vocab: {}, manual: {}, classCfg: {}, attendance: {}, practice: {} };
         annRes.data.forEach((a) => {
           const msg = String(a.message || '');
           Object.entries(SC_CLASS_META_TAGS).forEach(([type, tag]) => {
-            if (!a.class_id || !msg.startsWith(tag) || nextMeta[type][a.class_id]) return;
+            const ownerId = type === 'practice' ? a.target_student_id : a.class_id;
+            if (!ownerId || !msg.startsWith(tag) || nextMeta[type][ownerId]) return;
             try {
-              nextMeta[type][a.class_id] = JSON.parse(msg.slice(tag.length)) || {};
-              classMetaRowIds.current[`${type}|${a.class_id}`] = a.id;
+              nextMeta[type][ownerId] = JSON.parse(msg.slice(tag.length)) || {};
+              classMetaRowIds.current[`${type}|${ownerId}`] = a.id;
             } catch {
               // ignore corrupted metadata row
             }
@@ -2646,6 +3377,7 @@ export default function App() {
         });
         classMetaRef.current = nextMeta;
         setClassMeta(nextMeta);
+        setDataReady(true);
 
         setAnnouncements(
           annRes.data.filter((a) => !String(a.message || '').startsWith('__SC_'))
@@ -2700,7 +3432,11 @@ export default function App() {
           } else {
             const { data, error } = await supabase
               .from('announcements')
-              .insert([{ class_id: clsId, target_student_id: null, message: payload }])
+              .insert([
+                type === 'practice'
+                  ? { class_id: null, target_student_id: clsId, message: payload }
+                  : { class_id: clsId, target_student_id: null, message: payload }
+              ])
               .select()
               .single();
             if (error) throw error;
@@ -2736,6 +3472,29 @@ export default function App() {
     },
     [flushClassMeta]
   );
+
+  // One-time move of practice history saved in this browser (v3) into the student's account
+  useEffect(() => {
+    if (!dataReady || role !== 'student' || !currentStudent) return;
+    const code = currentStudent.student_code;
+    const localRuns = scReadLocalJson(`sc_practice_${code}`, null);
+    const localNb = scReadLocalJson(`sc_notebook_${code}`, null);
+    if (!localRuns && !localNb) return;
+    updateClassMeta('practice', currentStudent.id, (prev) => {
+      const runs = { ...(prev.runs || {}) };
+      Object.entries(localRuns || {}).forEach(([asgId, list]) => {
+        const seen = new Set((runs[asgId] || []).map((r) => r.at));
+        runs[asgId] = [...(runs[asgId] || []), ...(list || []).filter((r) => !seen.has(r.at))].slice(-30);
+      });
+      return { ...prev, runs, notebook: { ...(localNb || {}), ...(prev.notebook || {}) } };
+    });
+    try {
+      localStorage.removeItem(`sc_practice_${code}`);
+      localStorage.removeItem(`sc_notebook_${code}`);
+    } catch {
+      // ignore
+    }
+  }, [dataReady, role, currentStudent, updateClassMeta]);
 
   // Save the whole student meta map (status / note / custom tuition price)
   const persistStudentMetaMap = async (nextMap) => {
@@ -5292,6 +6051,27 @@ ${rawRubric}`;
       {/* CỔNG GIÁO VIÊN */}
       {role === 'teacher' && (
         <main className="relative z-10 max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+          {/* LỜI CHÚC DÀNH RIÊNG CHO CÔ HÀ */}
+          {(() => {
+            const hour = new Date().getHours();
+            const greeting =
+              hour < 11 ? 'Chào buổi sáng' : hour < 14 ? 'Chào buổi trưa' : hour < 18 ? 'Chào buổi chiều' : 'Chào buổi tối';
+            return (
+              <div className="relative overflow-hidden rounded-3xl bg-gradient-to-r from-pink-500 via-rose-500 to-fuchsia-500 p-4 sm:p-5 text-white shadow-md shadow-pink-200">
+                <div className="absolute -right-6 -top-8 text-8xl opacity-20 select-none pointer-events-none">💗</div>
+                <div className="relative flex items-center gap-3">
+                  <div className="text-3xl sm:text-4xl select-none">🌸</div>
+                  <div>
+                    <div className="text-xs sm:text-sm font-medium text-pink-50">{greeting} cô Hà ✨</div>
+                    <div className="text-base sm:text-xl font-extrabold tracking-tight">
+                      Chúc vợ làm việc luôn vui vẻ nha! 💕
+                    </div>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white p-4 rounded-3xl border border-pink-200/80 shadow-sm shadow-pink-100/40">
             <div className="flex flex-wrap items-center gap-2">
               <button
@@ -5770,7 +6550,24 @@ ${rawRubric}`;
                                 </div>
                               )}
                             </td>
-                            <td className="py-3 px-4 text-xs font-medium">{mySubs.length} bài</td>
+                            <td className="py-3 px-4 text-xs font-medium">
+                              <div>{mySubs.length} bài</div>
+                              {(() => {
+                                const pd = classMeta.practice[stu.id];
+                                const runCount = Object.values(pd?.runs || {}).reduce(
+                                  (n, list) => n + (Array.isArray(list) ? list.length : 0),
+                                  0
+                                );
+                                const nbPending = computeNotebookEntries(assignments, mySubs, pd?.notebook || {}).filter(
+                                  (e) => !e.mastered
+                                ).length;
+                                return (
+                                  <div className="text-[10px] text-violet-700 mt-0.5 whitespace-nowrap">
+                                    Luyện {runCount} lượt • Sổ tay còn {nbPending} câu
+                                  </div>
+                                );
+                              })()}
+                            </td>
                             <td className="py-3 px-4">
                               <span
                                 className={`px-2 py-0.5 rounded-full text-xs font-bold ${
@@ -7436,80 +8233,105 @@ ${rawRubric}`;
       {/* CỔNG HỌC SINH */}
       {role === 'student' && currentStudent && studentPortalData && (
         <main className="relative z-10 max-w-5xl mx-auto px-4 sm:px-6 py-6 space-y-6">
-          <div className="bg-gradient-to-r from-pink-100/90 via-white to-rose-100/80 p-5 sm:p-6 rounded-3xl border-2 border-pink-200 shadow-md shadow-pink-100/60 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-            <div className="flex items-start sm:items-center gap-3.5">
-              <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-pink-500 to-rose-500 text-white text-2xl flex items-center justify-center shadow-md shadow-pink-200 shrink-0">
-                🎒
-              </div>
-              <div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="px-2.5 py-0.5 rounded-xl bg-pink-600 text-white font-mono text-xs font-bold shadow-xs">
-                    {currentStudent.student_code}
-                  </span>
-                  <h1 className="text-lg sm:text-xl font-extrabold text-slate-900">
-                    Chào {currentStudent.full_name} 🌸
-                  </h1>
-                  <span className="px-2.5 py-0.5 rounded-full bg-white/90 border border-pink-200 text-[11px] font-bold text-pink-700">
-                    {studentPortalData.avgScore !== '—' && Number(studentPortalData.avgScore) >= 8
-                      ? '🏆 Ong chăm chỉ xuất sắc!'
-                      : studentPortalData.avgScore !== '—' && Number(studentPortalData.avgScore) >= 6.5
-                      ? '🌷 Đang tiến bộ từng ngày!'
-                      : '✨ Cố lên nào, cô Hà luôn đồng hành!'}
-                  </span>
-                </div>
-                <p className="text-xs text-slate-600 mt-1">
-                  Lớp cô Hà • <strong>{currentStudent.class_name}</strong> • Điểm trung bình hiện tại:{' '}
-                  <strong className="text-pink-600 text-sm">{studentPortalData.avgScore}/10</strong>
-                </p>
-              </div>
-            </div>
+          {(() => {
+            const allTasks = [...studentPortalData.remedialTasks, ...studentPortalData.classTasks];
+            const todoCount = allTasks.filter((t) => !studentPortalData.subByAsg[t.id]).length;
+            const nbPending = computeNotebookEntries(
+              assignments,
+              studentPortalData.mySubs,
+              classMeta.practice[currentStudent.id]?.notebook || {}
+            ).filter((e) => !e.mastered).length;
+            const avg = studentPortalData.avgScore;
+            const cheer =
+              avg !== '—' && Number(avg) >= 8
+                ? '🏆 Ong chăm chỉ xuất sắc — giữ vững phong độ nhé!'
+                : avg !== '—' && Number(avg) >= 6.5
+                ? '🌷 Em đang tiến bộ từng ngày!'
+                : '✨ Cố lên nào, cô Hà luôn đồng hành cùng em!';
+            const tabs = [
+              { id: 'tasks', icon: '✏️', label: 'Bài tập', count: todoCount },
+              { id: 'progress', icon: '🌟', label: 'Kết quả' },
+              { id: 'library', icon: '📚', label: 'Kho đề ôn tập' },
+              { id: 'notebook', icon: '📒', label: 'Sổ tay câu sai', count: nbPending },
+              { id: 'tuition', icon: '📅', label: 'Điểm danh & Học phí' }
+            ];
+            const stats = [
+              { label: 'Điểm TB', value: avg === '—' ? '—' : avg, tab: 'progress' },
+              { label: 'Bài cần làm', value: todoCount, tab: 'tasks' },
+              { label: 'Câu cần ôn', value: nbPending, tab: 'notebook' }
+            ];
+            return (
+              <>
+                <section className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-pink-500 via-rose-500 to-fuchsia-500 text-white p-5 sm:p-7 shadow-lg shadow-pink-200/70">
+                  <div className="absolute -top-16 -right-10 w-56 h-56 rounded-full bg-white/10 pointer-events-none" />
+                  <div className="absolute -bottom-20 left-1/3 w-64 h-64 rounded-full bg-white/10 pointer-events-none" />
+                  <div className="relative flex flex-col md:flex-row md:items-center justify-between gap-5">
+                    <div className="flex items-center gap-4 min-w-0">
+                      <div className="w-14 h-14 sm:w-16 sm:h-16 rounded-2xl bg-white/20 ring-1 ring-white/40 text-3xl flex items-center justify-center shrink-0">
+                        🎒
+                      </div>
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2 text-[11px] sm:text-xs font-semibold text-pink-50">
+                          <span className="px-2 py-0.5 rounded-lg bg-white/20 font-mono">{currentStudent.student_code}</span>
+                          <span>Lớp {currentStudent.class_name}</span>
+                        </div>
+                        <h1 className="text-xl sm:text-2xl font-extrabold tracking-tight mt-1 truncate">
+                          Chào {currentStudent.full_name} 🌸
+                        </h1>
+                        <p className="text-xs sm:text-sm text-pink-50 mt-0.5">{cheer}</p>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2 sm:gap-3 md:min-w-[360px]">
+                      {stats.map((st) => (
+                        <button
+                          key={st.label}
+                          type="button"
+                          onClick={() => setStudentTab(st.tab)}
+                          className="rounded-2xl bg-white/15 hover:bg-white/25 ring-1 ring-white/25 px-3 py-2.5 text-center transition"
+                        >
+                          <div className="text-xl sm:text-2xl font-extrabold leading-tight">{st.value}</div>
+                          <div className="text-[10px] sm:text-[11px] font-semibold text-pink-50">{st.label}</div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </section>
 
-            <div className="flex flex-wrap gap-2 shrink-0">
-              <button
-                onClick={() => setStudentTab('tasks')}
-                className={`px-4 py-2 rounded-2xl text-xs font-bold transition ${
-                  studentTab === 'tasks'
-                    ? 'bg-gradient-to-r from-pink-500 to-rose-500 text-white shadow-sm shadow-pink-200'
-                    : 'bg-white/90 text-pink-800 border border-pink-200 hover:bg-pink-50'
-                }`}
-              >
-                ✏️ Làm bài tập
-              </button>
-              <button
-                onClick={() => setStudentTab('progress')}
-                className={`px-4 py-2 rounded-2xl text-xs font-bold transition ${
-                  studentTab === 'progress'
-                    ? 'bg-gradient-to-r from-pink-500 to-rose-500 text-white shadow-sm shadow-pink-200'
-                    : 'bg-white/90 text-pink-800 border border-pink-200 hover:bg-pink-50'
-                }`}
-              >
-                🌟 Phong độ & Kết quả
-              </button>
-              <button
-                onClick={() => setStudentTab('tuition')}
-                className={`px-4 py-2 rounded-2xl text-xs font-bold transition ${
-                  studentTab === 'tuition'
-                    ? 'bg-gradient-to-r from-pink-500 to-rose-500 text-white shadow-sm shadow-pink-200'
-                    : 'bg-white/90 text-pink-800 border border-pink-200 hover:bg-pink-50'
-                }`}
-              >
-                📅 Điểm danh & Học phí
-              </button>
-            </div>
-          </div>
-
-          {/* DẢI ĐỘNG VIÊN HỌC VUI */}
-          <div className="bg-white/90 border border-pink-200/80 rounded-2xl px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs text-pink-900 shadow-xs">
-            <span className="font-medium">
-              🎀 <strong>Góc học vui Lớp cô Hà:</strong> Làm bài cẩn thận, nộp xong nhớ xem phần giải thích chi tiết từng câu để nhớ bài siêu lâu nhé!
-            </span>
-            <span className="text-[11px] font-bold text-pink-600 bg-pink-50 px-2.5 py-0.5 rounded-full border border-pink-200">
-              Đã hoàn thành {studentPortalData.mySubs.length} bài 💖
-            </span>
-          </div>
+                <nav className="sticky top-2 z-30 bg-white/90 backdrop-blur-md border border-pink-100 rounded-2xl p-1.5 shadow-sm flex gap-1 overflow-x-auto">
+                  {tabs.map((t) => {
+                    const active = studentTab === t.id;
+                    return (
+                      <button
+                        key={t.id}
+                        type="button"
+                        onClick={() => setStudentTab(t.id)}
+                        className={`flex-1 min-w-max inline-flex items-center justify-center gap-1.5 px-3.5 py-2.5 rounded-xl text-xs sm:text-sm font-bold whitespace-nowrap transition ${
+                          active
+                            ? 'bg-gradient-to-r from-pink-500 to-rose-500 text-white shadow-sm shadow-pink-200'
+                            : 'text-slate-600 hover:bg-pink-50 hover:text-pink-700'
+                        }`}
+                      >
+                        <span>{t.icon}</span>
+                        <span>{t.label}</span>
+                        {t.count > 0 && (
+                          <span
+                            className={`min-w-[20px] h-5 px-1.5 rounded-full text-[10px] font-extrabold inline-flex items-center justify-center ${
+                              active ? 'bg-white/25 text-white' : 'bg-rose-500 text-white'
+                            }`}
+                          >
+                            {t.count}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </nav>
+              </>
+            );
+          })()}
 
           {/* CẢNH BÁO HẠN NỘP SẮP ĐẾN / QUÁ HẠN */}
-          {studentPortalData.urgentTasks.length > 0 && (
+          {studentTab === 'tasks' && studentPortalData.urgentTasks.length > 0 && (
             <div className="bg-rose-50 border border-rose-200 rounded-2xl p-4 space-y-1.5">
               <div className="flex items-center gap-1.5 text-xs font-bold text-rose-900">
                 <Clock className="w-4 h-4 text-rose-600" />
@@ -7534,7 +8356,7 @@ ${rawRubric}`;
           )}
 
           {/* THÔNG BÁO NHẮC NHỞ TỪ GIÁO VIÊN */}
-          {studentPortalData.myAnnouncements.length > 0 && (
+          {studentTab === 'tasks' && studentPortalData.myAnnouncements.length > 0 && (
             <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 space-y-2">
               <div className="flex items-center gap-1.5 text-xs font-bold text-amber-900">
                 <Bell className="w-4 h-4 text-amber-600" />
@@ -7558,7 +8380,25 @@ ${rawRubric}`;
             </div>
           )}
 
-          {studentTab === 'tuition' ? (
+          {studentTab === 'library' ? (
+            <PracticeLibraryView
+              key={`lib-${currentStudent.id}`}
+              student={currentStudent}
+              assignments={assignments}
+              subByAsg={studentPortalData.subByAsg}
+              practiceData={classMeta.practice[currentStudent.id]}
+              onUpdatePractice={(updater) => updateClassMeta('practice', currentStudent.id, updater)}
+            />
+          ) : studentTab === 'notebook' ? (
+            <MistakeNotebookView
+              key={`nb-${currentStudent.id}`}
+              student={currentStudent}
+              assignments={assignments}
+              mySubs={studentPortalData.mySubs}
+              practiceData={classMeta.practice[currentStudent.id]}
+              onUpdatePractice={(updater) => updateClassMeta('practice', currentStudent.id, updater)}
+            />
+          ) : studentTab === 'tuition' ? (
             <StudentTuitionView
               student={currentStudent}
               classObj={classes.find((c) => c.id === currentStudent.class_id) || null}
@@ -7625,10 +8465,34 @@ ${rawRubric}`;
                 </div>
               )}
 
-              <div className="space-y-3">
-                <h2 className="text-sm font-bold text-slate-800">Bài tập của lớp</h2>
-                <div className="grid sm:grid-cols-2 gap-4">
-                  {studentPortalData.classTasks.map((task) => {
+              {[
+                {
+                  key: 'todo',
+                  title: '📝 Cần làm',
+                  list: studentPortalData.classTasks
+                    .filter((t) => !studentPortalData.subByAsg[t.id])
+                    .sort((a, b) => String(a.due_date || '9999').localeCompare(String(b.due_date || '9999'))),
+                  empty: 'Em đã làm hết bài được giao rồi, giỏi quá! 🎉'
+                },
+                {
+                  key: 'done',
+                  title: '✅ Đã hoàn thành',
+                  list: studentPortalData.classTasks.filter((t) => studentPortalData.subByAsg[t.id]),
+                  empty: 'Chưa có bài nào hoàn thành.'
+                }
+              ].map((group) => (
+              <div key={group.key} className="space-y-3">
+                <h2 className="text-sm font-bold text-slate-800 flex items-center gap-2">
+                  <span>{group.title}</span>
+                  <span className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 text-[11px]">{group.list.length}</span>
+                </h2>
+                {group.list.length === 0 ? (
+                  <div className="p-5 rounded-2xl bg-white/70 border border-dashed border-slate-200 text-center text-xs text-slate-400">
+                    {group.empty}
+                  </div>
+                ) : (
+                <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {group.list.map((task) => {
                     const sub = studentPortalData.subByAsg[task.id];
                     const qList = getAssignmentQuestions(task);
                     const meta = getAssignmentMeta(task);
@@ -7644,11 +8508,22 @@ ${rawRubric}`;
                         localStorage.getItem(`sc_draft_${currentStudent.student_code}_${task.id}`)
                       );
 
+                    const accent = sub
+                      ? sub.score !== null && sub.score !== undefined
+                        ? 'bg-emerald-400'
+                        : 'bg-sky-400'
+                      : deadlineInfo && deadlineInfo.diffDays < 0
+                      ? 'bg-rose-500'
+                      : deadlineInfo?.urgent
+                      ? 'bg-amber-400'
+                      : 'bg-pink-400';
+
                     return (
                       <div
                         key={task.id}
-                        className="bg-white p-4 rounded-3xl border border-pink-200/80 shadow-sm shadow-pink-100/40 flex flex-col justify-between gap-3"
+                        className="relative overflow-hidden bg-white p-4 pl-5 rounded-3xl border border-pink-100 shadow-sm shadow-pink-100/40 hover:shadow-md hover:-translate-y-0.5 transition flex flex-col justify-between gap-3"
                       >
+                        <div className={`absolute left-0 top-4 bottom-4 w-1.5 rounded-r-full ${accent}`} />
                         <div>
                           <div className="flex flex-wrap items-center justify-between gap-1.5 text-xs">
                             <div className="flex flex-wrap items-center gap-1.5">
@@ -7730,10 +8605,20 @@ ${rawRubric}`;
                     );
                   })}
                 </div>
+                )}
               </div>
+              ))}
             </div>
           ) : (
             <div className="space-y-6">
+              <StudentGradebookView
+                student={currentStudent}
+                unified={unifiedScoresByStudent[currentStudent.id]}
+                vocabData={classMeta.vocab[currentStudent.class_id]}
+                manualData={classMeta.manual[currentStudent.class_id]}
+                mySubs={studentPortalData.mySubs}
+                assignments={assignments}
+              />
               <div className="bg-white p-5 rounded-3xl border border-pink-200/80 shadow-sm shadow-pink-100/40">
                 <h2 className="font-bold text-slate-900 mb-1">Biểu đồ phong độ học tập của em</h2>
                 <p className="text-xs text-slate-500 mb-4">Theo dõi sự tiến bộ qua từng bài tập</p>
